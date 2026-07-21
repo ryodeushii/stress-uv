@@ -247,7 +247,7 @@ available_memory_mib() {
     fi
 }
 
-vm_bytes_per_worker_mib() {
+vm_bytes_total_mib() {
     local workers=$1
     local available_mib
     local total_mib
@@ -260,7 +260,7 @@ vm_bytes_per_worker_mib() {
     per_worker_mib=$((total_mib / workers))
     (( per_worker_mib >= 16 )) ||
         die 'calculated VM allocation is below 16 MiB per worker'
-    printf '%d\n' "$per_worker_mib"
+    printf '%d\n' "$total_mib"
 }
 
 select_stages() {
@@ -312,7 +312,7 @@ build_stage_command() {
             ;;
         memory-vm)
             (( workers > 0 )) || die 'memory-vm requires at least one selected CPU'
-            vm_mib=$(vm_bytes_per_worker_mib "$workers")
+            vm_mib=$(vm_bytes_total_mib "$workers")
             STAGE_COMMAND=(stress-ng --vm "$workers" --vm-bytes "${vm_mib}M"
                 --vm-method all)
             duration=$VM_DURATION
@@ -347,8 +347,8 @@ print_plan() {
             done
         else
             if [[ $stage == memory-vm ]]; then
-                vm_mib=$(vm_bytes_per_worker_mib "${#CPUS[@]}")
-                printf 'MEMORY target=%s%% workers=%s per-worker=%sM\n' \
+                vm_mib=$(vm_bytes_total_mib "${#CPUS[@]}")
+                printf 'MEMORY target=%s%% workers=%s total=%sM\n' \
                     "$MEMORY_PERCENT" "${#CPUS[@]}" "$vm_mib"
             fi
             printf 'STAGE %s\n' "$stage"

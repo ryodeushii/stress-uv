@@ -196,7 +196,7 @@ test_vm_allocation_respects_cgroup_v2_headroom() {
         STRESS_UV_CGROUP_ROOT="$TEST_TMP/cgroup" \
         "$HARNESS" memory-vm --dry-run --cpu-list 0-1 --memory-percent 50)
 
-    assert_contains "$output" '--vm-bytes 192M'
+    assert_contains "$output" '--vm-bytes 384M'
 }
 
 test_vm_allocation_respects_cgroup_v1_headroom() {
@@ -212,7 +212,7 @@ test_vm_allocation_respects_cgroup_v1_headroom() {
         STRESS_UV_CGROUP_ROOT="$TEST_TMP/cgroup" \
         "$HARNESS" memory-vm --dry-run --cpu-list 0-1 --memory-percent 50)
 
-    assert_contains "$output" '--vm-bytes 192M'
+    assert_contains "$output" '--vm-bytes 384M'
 }
 
 test_vm_allocation_respects_cgroup_v2_ancestor_limit() {
@@ -230,7 +230,7 @@ test_vm_allocation_respects_cgroup_v2_ancestor_limit() {
         STRESS_UV_CGROUP_ROOT="$TEST_TMP/cgroup" \
         "$HARNESS" memory-vm --dry-run --cpu-list 0-1 --memory-percent 50)
 
-    assert_contains "$output" '--vm-bytes 192M'
+    assert_contains "$output" '--vm-bytes 384M'
 }
 
 test_vm_allocation_respects_cgroup_v1_ancestor_limit() {
@@ -248,7 +248,7 @@ test_vm_allocation_respects_cgroup_v1_ancestor_limit() {
         STRESS_UV_CGROUP_ROOT="$TEST_TMP/cgroup" \
         "$HARNESS" memory-vm --dry-run --cpu-list 0-1 --memory-percent 50)
 
-    assert_contains "$output" '--vm-bytes 192M'
+    assert_contains "$output" '--vm-bytes 384M'
 }
 
 test_report_marks_interrupted_run_incomplete() {
