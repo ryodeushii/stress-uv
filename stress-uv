@@ -1,0 +1,1179 @@
+#!/usr/bin/env bash
+
+set -u
+umask 077
+
+VERSION=0.1.0
+SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
+PROC_ROOT=${STRESS_UV_PROC_ROOT:-/proc}
+CGROUP_ROOT=${STRESS_UV_CGROUP_ROOT:-/sys/fs/cgroup}
+
+MODE=""
+DRY_RUN=0
+NO_TUI=0
+ASSUME_YES=0
+OUTPUT_ROOT="$PWD/runs"
+CPU_LIST=""
+CPU_DURATION=20m
+CORE_DURATION=1m
+CACHE_DURATION=20m
+VM_DURATION=3h
+MEMORY_PERCENT=85
+REFRESH_RATE=2
+TEMPERATURE_THRESHOLD=90
+RUN_DIR=""
+SESSION=""
+TUI_PANE=""
+WORKER_PANE=""
+LAUNCHER_PID=""
+LAUNCHER_STARTTIME=""
+LAUNCHER_WATCHER_PID=""
+STARTED_AT=""
+TURBOSTAT_PID=""
+TURBOSTAT_OUTER_PGID_FILE=""
+TURBOSTAT_INNER_PGID_FILE=""
+ACTIVE_STAGE_WRAPPER_PID=""
+ACTIVE_STAGE_OUTER_PGID_FILE=""
+ACTIVE_STAGE_INNER_PGID_FILE=""
+CURRENT_STAGE=""
+WORKER_FINISHED=0
+WORKER_CLEANING_UP=0
+SUPERVISED_CHILD_PID=""
+STAGE_COMMAND=()
+CPUS=()
+SELECTED_STAGES=()
+
+usage() {
+    cat <<'EOF'
+Usage:
+  stress-uv MODE [OPTIONS]
+  stress-uv report RUN_DIR
+
+Suites:
+  cpu                 Run all CPU stability stages sequentially.
+  memory              Run all memory stability stages sequentially.
+  all                 Run cpu, then memory, sequentially.
+
+Individual stages:
+  cpu-sustained       Full all-CPU matrix workload.
+  cpu-transition      Repeated 50% load transitions.
+  cpu-core-cycle      Pin one worker to each selected logical CPU.
+  memory-cache        Exercise the selected cache level.
+  memory-vm           Verify writes across a bounded memory allocation.
+
+Options:
+  --cpu-list LIST          Logical CPUs for core cycling (default: online CPUs).
+  --cpu-duration TIME      Sustained/transition duration (default: 20m).
+  --core-duration TIME     Duration per logical CPU (default: 1m).
+  --cache-duration TIME    Cache stage duration (default: 20m).
+  --vm-duration TIME       VM stage duration (default: 3h).
+  --memory-percent N       Percent of available RAM across all VM workers (default: 85).
+  --output DIR             Run artifact root (default: ./runs).
+  --refresh-rate SECONDS   s-tui and turbostat interval (default: 2).
+  --temperature-threshold C
+                            s-tui warning threshold only (default: 90).
+  --no-tui                 Run without tmux and s-tui; keep file telemetry.
+  --dry-run                Print the exact sequential plan without running it.
+  --yes                    Skip the destructive-run confirmation.
+  -h, --help               Show this help.
+  --version                Show the version.
+
+The harness requires stress-ng and sudo. Interactive mode also requires tmux
+and s-tui. turbostat and sensors are optional telemetry sources.
+EOF
+}
+
+die() {
+    printf 'stress-uv: %s\n' "$*" >&2
+    exit 2
+}
+
+command_exists() {
+    command -v -- "$1" >/dev/null 2>&1
+}
+
+validate_duration() {
+    [[ $1 =~ ^[1-9][0-9]*([.][0-9]+)?[smhdy]$ ]] ||
+        die "invalid duration '$1'; use values such as 30s, 20m, or 3h"
+}
+
+validate_integer_range() {
+    local value=$1
+    local minimum=$2
+    local maximum=$3
+    local name=$4
+
+    [[ $value =~ ^[0-9]+$ ]] || die "$name must be an integer"
+    (( value >= minimum && value <= maximum )) ||
+        die "$name must be between $minimum and $maximum"
+}
+
+default_cpu_list() {
+    local online
+
+    if [[ -r /sys/devices/system/cpu/online ]]; then
+        read -r online < /sys/devices/system/cpu/online
+        printf '%s\n' "$online"
+        return
+    fi
+
+    printf '0-%d\n' "$(( $(getconf _NPROCESSORS_ONLN) - 1 ))"
+}
+
+expand_cpu_list() {
+    local list=$1
+    local part
+    local start
+    local end
+    local cpu
+    local -A seen=()
+
+    CPUS=()
+    IFS=',' read -r -a parts <<< "$list"
+    ((${#parts[@]} > 0)) || die 'CPU list is empty'
+
+    for part in "${parts[@]}"; do
+        if [[ $part =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            start=${BASH_REMATCH[1]}
+            end=${BASH_REMATCH[2]}
+            (( start <= end )) || die "invalid descending CPU range '$part'"
+            (( end <= 4095 )) || die "CPU ID is too large in '$part'"
+            for ((cpu = start; cpu <= end; cpu++)); do
+                [[ ${seen[$cpu]+set} ]] && continue
+                CPUS+=("$cpu")
+                seen[$cpu]=1
+            done
+        elif [[ $part =~ ^[0-9]+$ ]]; then
+            (( part <= 4095 )) || die "CPU ID is too large: '$part'"
+            [[ ${seen[$part]+set} ]] && continue
+            CPUS+=("$part")
+            seen[$part]=1
+        else
+            die "invalid CPU list item '$part'"
+        fi
+    done
+
+    ((${#CPUS[@]} > 0)) || die 'CPU list expands to no CPUs'
+}
+
+host_available_memory_mib() {
+    local key
+    local value
+    local unit
+
+    while read -r key value unit; do
+        if [[ $key == MemAvailable: ]]; then
+            printf '%d\n' "$((value / 1024))"
+            return
+        fi
+    done < "$PROC_ROOT/meminfo"
+
+    die "cannot read MemAvailable from $PROC_ROOT/meminfo"
+}
+
+cgroup_tree_available_memory_mib() {
+    local directory=$1
+    local root=${2%/}
+    local maximum_file=$3
+    local current_file=$4
+    local maximum
+    local current
+    local remaining_mib
+    local available_mib=""
+
+    while [[ $directory == "$root" || $directory == "$root/"* ]]; do
+        if [[ -r $directory/$maximum_file && -r $directory/$current_file ]]; then
+            read -r maximum < "$directory/$maximum_file"
+            read -r current < "$directory/$current_file"
+            if [[ $maximum != max && $maximum =~ ^[0-9]+$ && $current =~ ^[0-9]+$ ]]; then
+                if (( maximum <= current )); then
+                    printf '0\n'
+                    return 0
+                fi
+                remaining_mib=$(((maximum - current) / 1024 / 1024))
+                if [[ -z $available_mib ]] || (( remaining_mib < available_mib )); then
+                    available_mib=$remaining_mib
+                fi
+            fi
+        fi
+
+        [[ $directory == "$root" ]] && break
+        directory=${directory%/*}
+    done
+
+    [[ -n $available_mib ]] || return 1
+    printf '%d\n' "$available_mib"
+}
+
+cgroup_available_memory_mib() {
+    local hierarchy
+    local controllers
+    local cgroup_path
+    local controller_root
+    local available_mib
+
+    [[ -r $PROC_ROOT/self/cgroup ]] || return 1
+    while IFS=: read -r hierarchy controllers cgroup_path; do
+        [[ $cgroup_path == /* && $cgroup_path != *..* ]] || continue
+        if [[ $hierarchy == 0 && -z $controllers ]]; then
+            if available_mib=$(cgroup_tree_available_memory_mib \
+                "$CGROUP_ROOT$cgroup_path" "$CGROUP_ROOT" memory.max memory.current); then
+                printf '%d\n' "$available_mib"
+                return 0
+            fi
+        elif [[ ,$controllers, == *,memory,* ]]; then
+            for controller_root in "$CGROUP_ROOT/memory" "$CGROUP_ROOT"; do
+                if available_mib=$(cgroup_tree_available_memory_mib \
+                    "$controller_root$cgroup_path" "$controller_root" \
+                    memory.limit_in_bytes memory.usage_in_bytes); then
+                    printf '%d\n' "$available_mib"
+                    return 0
+                fi
+            done
+        fi
+    done < "$PROC_ROOT/self/cgroup"
+    return 1
+}
+
+available_memory_mib() {
+    local host_mib
+    local cgroup_mib
+
+    host_mib=$(host_available_memory_mib)
+    if cgroup_mib=$(cgroup_available_memory_mib) && (( cgroup_mib < host_mib )); then
+        printf '%d\n' "$cgroup_mib"
+    else
+        printf '%d\n' "$host_mib"
+    fi
+}
+
+vm_bytes_per_worker_mib() {
+    local workers=$1
+    local available_mib
+    local total_mib
+    local per_worker_mib
+
+    (( workers > 0 )) || die 'VM worker count must be positive'
+    available_mib=$(available_memory_mib)
+    (( available_mib > 0 )) || die 'available memory must be positive'
+    total_mib=$((available_mib * MEMORY_PERCENT / 100))
+    per_worker_mib=$((total_mib / workers))
+    (( per_worker_mib >= 16 )) ||
+        die 'calculated VM allocation is below 16 MiB per worker'
+    printf '%d\n' "$per_worker_mib"
+}
+
+select_stages() {
+    case $MODE in
+        cpu)
+            SELECTED_STAGES=(cpu-sustained cpu-transition cpu-core-cycle)
+            ;;
+        memory)
+            SELECTED_STAGES=(memory-cache memory-vm)
+            ;;
+        all)
+            SELECTED_STAGES=(cpu-sustained cpu-transition cpu-core-cycle memory-cache memory-vm)
+            ;;
+        cpu-sustained|cpu-transition|cpu-core-cycle|memory-cache|memory-vm)
+            SELECTED_STAGES=("$MODE")
+            ;;
+        *)
+            die "unknown mode '$MODE'"
+            ;;
+    esac
+}
+
+build_stage_command() {
+    local stage=$1
+    local cpu=${2:-}
+    local workers=${#CPUS[@]}
+    local vm_mib
+    local duration
+
+    case $stage in
+        cpu-sustained)
+            STAGE_COMMAND=(stress-ng --cpu 0 --cpu-method matrixprod)
+            duration=$CPU_DURATION
+            ;;
+        cpu-transition)
+            STAGE_COMMAND=(stress-ng --cpu 0 --cpu-method matrixprod
+                --cpu-load 50 --cpu-load-slice 100)
+            duration=$CPU_DURATION
+            ;;
+        cpu-core-cycle)
+            [[ $cpu =~ ^[0-9]+$ ]] || die 'cpu-core-cycle requires one numeric CPU ID'
+            STAGE_COMMAND=(stress-ng --cpu 1 --cpu-method matrixprod
+                --taskset "$cpu")
+            duration=$CORE_DURATION
+            ;;
+        memory-cache)
+            STAGE_COMMAND=(stress-ng --cache 0 --cache-level 3)
+            duration=$CACHE_DURATION
+            ;;
+        memory-vm)
+            (( workers > 0 )) || die 'memory-vm requires at least one selected CPU'
+            vm_mib=$(vm_bytes_per_worker_mib "$workers")
+            STAGE_COMMAND=(stress-ng --vm "$workers" --vm-bytes "${vm_mib}M"
+                --vm-method all)
+            duration=$VM_DURATION
+            ;;
+        *)
+            die "cannot build unknown stage '$stage'"
+            ;;
+    esac
+
+    STAGE_COMMAND+=(--timeout "$duration" --abort --verify --metrics-brief
+        --klog-check --log-brief)
+}
+
+print_command() {
+    printf '  sudo'
+    printf ' %q' "${STAGE_COMMAND[@]}"
+    printf '\n'
+}
+
+print_plan() {
+    local stage
+    local cpu
+    local vm_mib
+
+    printf 'MODE %s\n' "$MODE"
+    for stage in "${SELECTED_STAGES[@]}"; do
+        if [[ $stage == cpu-core-cycle ]]; then
+            for cpu in "${CPUS[@]}"; do
+                printf 'STAGE cpu-core-cycle cpu=%s\n' "$cpu"
+                build_stage_command "$stage" "$cpu"
+                print_command
+            done
+        else
+            if [[ $stage == memory-vm ]]; then
+                vm_mib=$(vm_bytes_per_worker_mib "${#CPUS[@]}")
+                printf 'MEMORY target=%s%% workers=%s per-worker=%sM\n' \
+                    "$MEMORY_PERCENT" "${#CPUS[@]}" "$vm_mib"
+            fi
+            printf 'STAGE %s\n' "$stage"
+            build_stage_command "$stage"
+            print_command
+        fi
+    done
+}
+
+parse_options() {
+    while (($#)); do
+        case $1 in
+            --cpu-list)
+                (($# >= 2)) || die '--cpu-list requires a value'
+                CPU_LIST=$2
+                shift 2
+                ;;
+            --cpu-duration)
+                (($# >= 2)) || die '--cpu-duration requires a value'
+                CPU_DURATION=$2
+                shift 2
+                ;;
+            --core-duration)
+                (($# >= 2)) || die '--core-duration requires a value'
+                CORE_DURATION=$2
+                shift 2
+                ;;
+            --cache-duration)
+                (($# >= 2)) || die '--cache-duration requires a value'
+                CACHE_DURATION=$2
+                shift 2
+                ;;
+            --vm-duration)
+                (($# >= 2)) || die '--vm-duration requires a value'
+                VM_DURATION=$2
+                shift 2
+                ;;
+            --memory-percent)
+                (($# >= 2)) || die '--memory-percent requires a value'
+                MEMORY_PERCENT=$2
+                shift 2
+                ;;
+            --output)
+                (($# >= 2)) || die '--output requires a value'
+                OUTPUT_ROOT=$2
+                shift 2
+                ;;
+            --refresh-rate)
+                (($# >= 2)) || die '--refresh-rate requires a value'
+                REFRESH_RATE=$2
+                shift 2
+                ;;
+            --temperature-threshold)
+                (($# >= 2)) || die '--temperature-threshold requires a value'
+                TEMPERATURE_THRESHOLD=$2
+                shift 2
+                ;;
+            --no-tui)
+                NO_TUI=1
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=1
+                shift
+                ;;
+            --yes)
+                ASSUME_YES=1
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            --version)
+                printf 'stress-uv %s\n' "$VERSION"
+                exit 0
+                ;;
+            *)
+                die "unknown option '$1'"
+                ;;
+        esac
+    done
+
+    validate_duration "$CPU_DURATION"
+    validate_duration "$CORE_DURATION"
+    validate_duration "$CACHE_DURATION"
+    validate_duration "$VM_DURATION"
+    validate_integer_range "$MEMORY_PERCENT" 1 90 'memory percent'
+    validate_integer_range "$TEMPERATURE_THRESHOLD" 40 110 'temperature threshold'
+    [[ $REFRESH_RATE =~ ^[1-9][0-9]*([.][0-9]+)?$ ]] ||
+        die 'refresh rate must be a positive number'
+}
+
+state_value() {
+    local file=$1
+    local wanted=$2
+    local key
+    local value
+
+    [[ -r $file ]] || return 1
+    while IFS='=' read -r key value; do
+        if [[ $key == "$wanted" ]]; then
+            printf '%s\n' "$value"
+            return
+        fi
+    done < "$file"
+    return 1
+}
+
+hardware_error_pattern() {
+    printf '%s' 'machine check|hardware error|mce:|edac.*(error|fail)|uncorrected error|corrected error|fatal hardware|watchdog.*(lockup|stuck)|out of memory: killed process'
+}
+
+stress_log_has_verification_error() {
+    local dir=$1
+    local label
+    local exit_status
+    local verdict
+    local pattern='verification.*(fail|error)|checksum.*(fail|error)|data corruption|stress-ng: (fail|error):'
+
+    [[ -r $dir/stages.tsv ]] || return 1
+    while IFS=$'\t' read -r label exit_status verdict; do
+        [[ -n $label && -r $dir/$label.log ]] || continue
+        if grep -Eiq "$pattern" "$dir/$label.log"; then
+            return 0
+        fi
+    done < "$dir/stages.tsv"
+    return 1
+}
+
+stage_verdict_for_exit() {
+    case $1 in
+        0) printf 'PASS\n' ;;
+        2|5) printf 'FAIL\n' ;;
+        *) printf 'ERROR\n' ;;
+    esac
+}
+
+stage_manifest_complete() {
+    local dir=$1
+    local label
+    local exit_status
+    local verdict
+    local extra
+    local -A expected=()
+    local -A actual=()
+
+    [[ -s $dir/expected-stages && -s $dir/stages.tsv ]] || return 1
+    while IFS= read -r label; do
+        [[ -n $label && ! ${expected[$label]+set} ]] || return 1
+        expected[$label]=1
+    done < "$dir/expected-stages"
+
+    while IFS=$'\t' read -r label exit_status verdict extra; do
+        [[ -n $label && $exit_status =~ ^[0-9]+$ && $verdict =~ ^(PASS|FAIL|ERROR)$ ]] ||
+            return 1
+        ((${#exit_status} <= 3 && 10#$exit_status <= 255)) || return 1
+        [[ $verdict == "$(stage_verdict_for_exit "$exit_status")" ]] || return 1
+        [[ -z $extra && ${expected[$label]+set} && ! ${actual[$label]+set} ]] || return 1
+        actual[$label]=1
+    done < "$dir/stages.tsv"
+
+    ((${#actual[@]} == ${#expected[@]})) || return 1
+    for label in "${!expected[@]}"; do
+        [[ ${actual[$label]+set} ]] || return 1
+    done
+}
+
+report_run() {
+    local dir=$1
+    local status
+    local stage
+    local result=PASS
+    local reasons=()
+
+    [[ -d $dir ]] || die "run directory does not exist: $dir"
+    status=$(state_value "$dir/state" status || printf 'UNKNOWN')
+    stage=$(state_value "$dir/state" stage || printf 'unknown')
+
+    if [[ $status != COMPLETE ]]; then
+        result=INCOMPLETE
+        reasons+=("run state is $status")
+    elif [[ -s $dir/stages.tsv ]] && grep -Eq $'\t([1-9][0-9]*)\tFAIL' "$dir/stages.tsv"; then
+        result=FAIL
+        reasons+=('stage failure')
+    elif [[ -s $dir/stages.tsv ]] && grep -Eq $'\t([1-9][0-9]*)\tERROR' "$dir/stages.tsv"; then
+        result=INCONCLUSIVE
+        reasons+=('stage error')
+    elif ! stage_manifest_complete "$dir"; then
+        result=INCONCLUSIVE
+        reasons+=('stage manifest incomplete')
+    fi
+
+    if [[ -s $dir/kernel.log ]] && grep -Eiq "$(hardware_error_pattern)" "$dir/kernel.log"; then
+        result=FAIL
+        reasons+=('kernel hardware error')
+    fi
+
+    if stress_log_has_verification_error "$dir"; then
+        result=FAIL
+        reasons+=('stress log verification error')
+    fi
+
+    if [[ $result == PASS && ! -s $dir/kernel.log ]]; then
+        result=INCONCLUSIVE
+        reasons+=('kernel log unavailable')
+    fi
+
+    printf 'Run: %s\n' "$dir"
+    printf 'Result: %s\n' "$result"
+    printf 'Last stage: %s\n' "$stage"
+    if ((${#reasons[@]})); then
+        printf 'Reasons: %s\n' "$(IFS=', '; printf '%s' "${reasons[*]}")"
+    fi
+    [[ -f $dir/stages.tsv ]] && printf 'Stages: %s/stages.tsv\n' "$dir"
+    [[ -f $dir/kernel.log ]] && printf 'Kernel log: %s/kernel.log\n' "$dir"
+    [[ -d $dir/telemetry ]] && printf 'Telemetry: %s/telemetry\n' "$dir"
+    [[ $result == PASS ]]
+}
+
+write_state() {
+    local status=$1
+    local stage=$2
+    local temporary="$RUN_DIR/state.tmp"
+
+    {
+        printf 'status=%s\n' "$status"
+        printf 'mode=%s\n' "$MODE"
+        printf 'stage=%s\n' "$stage"
+        printf 'started_at=%s\n' "$STARTED_AT"
+        printf 'updated_at=%s\n' "$(date --iso-8601=seconds)"
+    } > "$temporary"
+    mv -- "$temporary" "$RUN_DIR/state"
+}
+
+collect_metadata() {
+    {
+        printf 'stress-uv version: %s\n' "$VERSION"
+        printf 'mode: %s\n' "$MODE"
+        printf 'started: %s\n' "$STARTED_AT"
+        printf 'kernel: '
+        uname -a
+        printf '\nCPU topology:\n'
+        lscpu
+        printf '\nstress-ng:\n'
+        stress-ng --version
+        if command_exists s-tui; then
+            printf '\ns-tui:\n'
+            s-tui --version
+        fi
+        if [[ -r /proc/cpuinfo ]]; then
+            printf '\nMicrocode records:\n'
+            grep -m 2 '^microcode' /proc/cpuinfo || true
+        fi
+        if command_exists sensors; then
+            printf '\nInitial sensors:\n'
+            sensors || true
+        fi
+    } > "$RUN_DIR/metadata.txt" 2>&1
+}
+
+write_expected_stages() {
+    local stage
+    local cpu
+
+    : > "$RUN_DIR/expected-stages"
+    for stage in "${SELECTED_STAGES[@]}"; do
+        if [[ $stage == cpu-core-cycle ]]; then
+            for cpu in "${CPUS[@]}"; do
+                printf '%s\n' "${stage}-cpu-${cpu}" >> "$RUN_DIR/expected-stages"
+            done
+        else
+            printf '%s\n' "$stage" >> "$RUN_DIR/expected-stages"
+        fi
+    done
+}
+
+start_file_telemetry() {
+    if command_exists sensors; then
+        sensors > "$RUN_DIR/telemetry/sensors-before.txt" 2>&1 || true
+    fi
+
+    if command_exists turbostat; then
+        TURBOSTAT_OUTER_PGID_FILE="$RUN_DIR/telemetry/.turbostat-outer.pid"
+        TURBOSTAT_INNER_PGID_FILE="$RUN_DIR/telemetry/.turbostat-inner.pid"
+        : > "$TURBOSTAT_OUTER_PGID_FILE"
+        : > "$TURBOSTAT_INNER_PGID_FILE"
+        setsid "$SCRIPT_PATH" __privileged_supervisor \
+            "$TURBOSTAT_OUTER_PGID_FILE" "$TURBOSTAT_INNER_PGID_FILE" \
+            turbostat --quiet --Summary --interval "$REFRESH_RATE" \
+            --out "$RUN_DIR/telemetry/turbostat.txt" \
+            > "$RUN_DIR/telemetry/turbostat-errors.txt" 2>&1 &
+        TURBOSTAT_PID=$!
+    else
+        printf 'turbostat is not installed\n' > "$RUN_DIR/telemetry/turbostat-unavailable.txt"
+    fi
+}
+
+stop_file_telemetry() {
+    if [[ $TURBOSTAT_PID =~ ^[1-9][0-9]*$ ]]; then
+        terminate_supervised_command "$TURBOSTAT_PID" \
+            "$TURBOSTAT_OUTER_PGID_FILE" "$TURBOSTAT_INNER_PGID_FILE"
+    fi
+    TURBOSTAT_PID=""
+    rm -f -- "$TURBOSTAT_OUTER_PGID_FILE" "$TURBOSTAT_INNER_PGID_FILE"
+    TURBOSTAT_OUTER_PGID_FILE=""
+    TURBOSTAT_INNER_PGID_FILE=""
+    if command_exists sensors; then
+        sensors > "$RUN_DIR/telemetry/sensors-after.txt" 2>&1 || true
+    fi
+}
+
+read_process_record() {
+    local file=$1
+    local pid
+    local starttime
+    local extra
+
+    [[ -s $file ]] || return 1
+    read -r pid starttime extra < "$file" || return 1
+    [[ $pid =~ ^[1-9][0-9]*$ && $starttime =~ ^[0-9]+$ && -z $extra ]] || return 1
+    printf '%s %s\n' "$pid" "$starttime"
+}
+
+process_is_running() {
+    local pid=$1
+    local stat
+    local stat_tail
+    local state
+
+    kill -0 "$pid" 2>/dev/null || return 1
+    [[ -r $PROC_ROOT/$pid/stat ]] || return 0
+    stat=$(< "$PROC_ROOT/$pid/stat")
+    stat_tail=${stat##*) }
+    state=${stat_tail%% *}
+    [[ $state != Z ]]
+}
+
+process_starttime() {
+    local pid=$1
+    local stat
+    local stat_tail
+    local fields=()
+
+    [[ -r $PROC_ROOT/$pid/stat ]] || return 1
+    stat=$(< "$PROC_ROOT/$pid/stat")
+    stat_tail=${stat##*) }
+    read -r -a fields <<< "$stat_tail"
+    ((${#fields[@]} >= 20)) || return 1
+    [[ ${fields[19]} =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${fields[19]}"
+}
+
+process_matches_identity() {
+    local pid=$1
+    local expected_starttime=$2
+    local actual_starttime
+
+    actual_starttime=$(process_starttime "$pid") || return 1
+    process_is_running "$pid" && [[ $actual_starttime == "$expected_starttime" ]]
+}
+
+write_process_record() {
+    local file=$1
+    local pid=$2
+    local starttime
+
+    starttime=$(process_starttime "$pid") || return 1
+    printf '%s %s\n' "$pid" "$starttime" > "$file"
+}
+
+signal_recorded_group() {
+    local signal=$1
+    local record_file=$2
+    local privileged=$3
+    local record
+    local pid
+    local expected_starttime
+    local actual_starttime
+
+    record=$(read_process_record "$record_file" 2>/dev/null || true)
+    [[ -n $record ]] || return 0
+    read -r pid expected_starttime <<< "$record"
+    actual_starttime=$(process_starttime "$pid" 2>/dev/null || true)
+    [[ -n $actual_starttime && $actual_starttime == "$expected_starttime" ]] || return 0
+    if (( privileged == 1 )); then
+        sudo -- kill "-$signal" -- "-$pid" 2>/dev/null || true
+    else
+        kill "-$signal" -- "-$pid" 2>/dev/null || true
+    fi
+}
+
+terminate_supervised_command() {
+    local wrapper_pid=$1
+    local outer_pgid_file=$2
+    local inner_pgid_file=$3
+    local attempt
+
+    signal_recorded_group TERM "$inner_pgid_file" 1
+    signal_recorded_group TERM "$outer_pgid_file" 1
+    kill -TERM "$wrapper_pid" 2>/dev/null || true
+
+    for ((attempt = 0; attempt < 10; attempt++)); do
+        process_is_running "$wrapper_pid" || break
+        sleep 0.1
+    done
+    signal_recorded_group KILL "$inner_pgid_file" 1
+    signal_recorded_group KILL "$outer_pgid_file" 1
+    kill -KILL "$wrapper_pid" 2>/dev/null || true
+    wait "$wrapper_pid" 2>/dev/null || true
+}
+
+terminate_active_stage() {
+    if [[ $ACTIVE_STAGE_WRAPPER_PID =~ ^[1-9][0-9]*$ ]]; then
+        terminate_supervised_command "$ACTIVE_STAGE_WRAPPER_PID" \
+            "$ACTIVE_STAGE_OUTER_PGID_FILE" "$ACTIVE_STAGE_INNER_PGID_FILE"
+    fi
+
+    rm -f -- "$ACTIVE_STAGE_OUTER_PGID_FILE" "$ACTIVE_STAGE_INNER_PGID_FILE"
+    ACTIVE_STAGE_WRAPPER_PID=""
+    ACTIVE_STAGE_OUTER_PGID_FILE=""
+    ACTIVE_STAGE_INNER_PGID_FILE=""
+}
+
+supervisor_signal() {
+    trap '' INT TERM HUP
+    if [[ $SUPERVISED_CHILD_PID =~ ^[1-9][0-9]*$ ]]; then
+        kill -TERM "$SUPERVISED_CHILD_PID" 2>/dev/null || true
+    fi
+    while :; do
+        sleep 1
+    done
+}
+
+root_supervisor_main() {
+    local inner_pgid_file=$1
+    local exit_status
+
+    shift
+    (($# > 0)) || die 'privileged supervisor received no command'
+    write_process_record "$inner_pgid_file" "$$" || die 'cannot record privileged supervisor identity'
+    "$@" &
+    SUPERVISED_CHILD_PID=$!
+
+    trap supervisor_signal INT TERM HUP
+    if wait "$SUPERVISED_CHILD_PID"; then
+        exit_status=0
+    else
+        exit_status=$?
+    fi
+    trap - INT TERM HUP
+    return "$exit_status"
+}
+
+privileged_supervisor_main() {
+    local outer_pgid_file=$1
+    local inner_pgid_file=$2
+    local exit_status
+
+    shift 2
+    (($# > 0)) || die 'outer supervisor received no command'
+    write_process_record "$outer_pgid_file" "$$" || die 'cannot record outer supervisor identity'
+    sudo -- setsid "$SCRIPT_PATH" __root_supervisor "$inner_pgid_file" "$@" &
+    SUPERVISED_CHILD_PID=$!
+
+    trap supervisor_signal INT TERM HUP
+    if wait "$SUPERVISED_CHILD_PID"; then
+        exit_status=0
+    else
+        exit_status=$?
+    fi
+    trap - INT TERM HUP
+    return "$exit_status"
+}
+
+collect_kernel_log() {
+    if ! sudo journalctl -k --since "$STARTED_AT" --no-pager -o short-iso \
+        > "$RUN_DIR/kernel.log" 2> "$RUN_DIR/kernel-errors.txt"; then
+        : > "$RUN_DIR/kernel.log"
+    fi
+}
+
+run_stress_stage() {
+    local stage=$1
+    local cpu=${2:-}
+    local label=$stage
+    local log
+    local exit_status
+    local verdict
+    local outer_pgid_file="$RUN_DIR/.active-stage-outer.pid"
+    local inner_pgid_file="$RUN_DIR/.active-stage-inner.pid"
+    local attempt
+
+    [[ -n $cpu ]] && label="${stage}-cpu-${cpu}"
+    log="$RUN_DIR/${label}.log"
+    build_stage_command "$stage" "$cpu"
+    CURRENT_STAGE=$label
+    write_state RUNNING "$label"
+    printf '\n[%s] START %s\n' "$(date --iso-8601=seconds)" "$label"
+    printf 'Command:'
+    printf ' %q' sudo "${STAGE_COMMAND[@]}" --log-file "$log"
+    printf '\n'
+
+    : > "$outer_pgid_file"
+    : > "$inner_pgid_file"
+    setsid "$SCRIPT_PATH" __privileged_supervisor \
+        "$outer_pgid_file" "$inner_pgid_file" \
+        "${STAGE_COMMAND[@]}" --log-file "$log" &
+    ACTIVE_STAGE_WRAPPER_PID=$!
+    ACTIVE_STAGE_OUTER_PGID_FILE=$outer_pgid_file
+    ACTIVE_STAGE_INNER_PGID_FILE=$inner_pgid_file
+    for ((attempt = 0; attempt < 100; attempt++)); do
+        [[ -s $inner_pgid_file ]] && break
+        process_is_running "$ACTIVE_STAGE_WRAPPER_PID" || break
+        sleep 0.01
+    done
+
+    if ! read_process_record "$inner_pgid_file" >/dev/null; then
+        terminate_active_stage
+        exit_status=125
+    elif wait "$ACTIVE_STAGE_WRAPPER_PID"; then
+        exit_status=0
+    else
+        exit_status=$?
+    fi
+    ACTIVE_STAGE_WRAPPER_PID=""
+    ACTIVE_STAGE_OUTER_PGID_FILE=""
+    ACTIVE_STAGE_INNER_PGID_FILE=""
+    rm -f -- "$outer_pgid_file" "$inner_pgid_file"
+
+    verdict=$(stage_verdict_for_exit "$exit_status")
+    printf '%s\t%s\t%s\n' "$label" "$exit_status" "$verdict" >> "$RUN_DIR/stages.tsv"
+    printf '[%s] END %s exit=%s verdict=%s\n' \
+        "$(date --iso-8601=seconds)" "$label" "$exit_status" "$verdict"
+    return "$exit_status"
+}
+
+run_selected_stages() {
+    local stage
+    local cpu
+
+    for stage in "${SELECTED_STAGES[@]}"; do
+        if [[ $stage == cpu-core-cycle ]]; then
+            for cpu in "${CPUS[@]}"; do
+                run_stress_stage "$stage" "$cpu" || return $?
+            done
+        else
+            run_stress_stage "$stage" || return $?
+        fi
+    done
+}
+
+worker_cleanup() {
+    local exit_status=$?
+
+    (( WORKER_CLEANING_UP == 0 )) || return "$exit_status"
+    WORKER_CLEANING_UP=1
+    trap - EXIT INT TERM HUP
+    set +e
+    if [[ $LAUNCHER_WATCHER_PID =~ ^[1-9][0-9]*$ ]]; then
+        kill -TERM "$LAUNCHER_WATCHER_PID" 2>/dev/null || true
+        wait "$LAUNCHER_WATCHER_PID" 2>/dev/null || true
+        LAUNCHER_WATCHER_PID=""
+    fi
+    terminate_active_stage
+    stop_file_telemetry
+    if (( WORKER_FINISHED == 0 )) && [[ -n $RUN_DIR && -d $RUN_DIR ]]; then
+        write_state ABORTED "${CURRENT_STAGE:-interrupted}"
+        printf '1\n' > "$RUN_DIR/exit-code"
+    fi
+    if [[ -n $SESSION ]] && command_exists tmux && tmux has-session -t "$SESSION" 2>/dev/null; then
+        tmux kill-session -t "$SESSION" 2>/dev/null || true
+    fi
+    return "$exit_status"
+}
+
+worker_signal() {
+    exit 130
+}
+
+watch_launcher() {
+    while process_matches_identity "$LAUNCHER_PID" "$LAUNCHER_STARTTIME"; do
+        sleep 0.1
+    done
+    [[ -e $RUN_DIR/launcher-detached ]] && return
+    kill -TERM "$$"
+}
+
+worker_main() {
+    (($# == 15)) || die 'internal worker received invalid arguments'
+    RUN_DIR=$1
+    MODE=$2
+    CPU_DURATION=$3
+    CORE_DURATION=$4
+    CACHE_DURATION=$5
+    VM_DURATION=$6
+    MEMORY_PERCENT=$7
+    REFRESH_RATE=$8
+    TEMPERATURE_THRESHOLD=$9
+    CPU_LIST=${10}
+    SESSION=${11}
+    STARTED_AT=${12}
+    TUI_PANE=${13}
+    LAUNCHER_PID=${14}
+    LAUNCHER_STARTTIME=${15}
+    [[ -d $RUN_DIR ]] || die "run directory does not exist: $RUN_DIR"
+    validate_duration "$CPU_DURATION"
+    validate_duration "$CORE_DURATION"
+    validate_duration "$CACHE_DURATION"
+    validate_duration "$VM_DURATION"
+    validate_integer_range "$MEMORY_PERCENT" 1 95 'memory percent'
+    validate_integer_range "$REFRESH_RATE" 1 60 'refresh rate'
+    validate_integer_range "$TEMPERATURE_THRESHOLD" 1 120 'temperature threshold'
+    expand_cpu_list "$CPU_LIST"
+    select_stages
+    set -e
+    trap worker_cleanup EXIT
+    trap worker_signal INT TERM HUP
+    if [[ $LAUNCHER_PID =~ ^[1-9][0-9]*$ && $LAUNCHER_STARTTIME =~ ^[0-9]+$ ]]; then
+        watch_launcher &
+        LAUNCHER_WATCHER_PID=$!
+    fi
+
+    write_state RUNNING preflight
+    start_file_telemetry
+    local harness_status=1
+    run_selected_stages || true
+    stop_file_telemetry
+    collect_kernel_log
+    write_state COMPLETE complete
+    report_run "$RUN_DIR" > "$RUN_DIR/summary.txt" || true
+
+    if grep -q '^Result: PASS$' "$RUN_DIR/summary.txt"; then
+        harness_status=0
+    fi
+    printf '%s\n' "$harness_status" > "$RUN_DIR/exit-code"
+    WORKER_FINISHED=1
+
+    cat "$RUN_DIR/summary.txt"
+    if [[ -n $SESSION ]] && command_exists tmux && tmux has-session -t "$SESSION" 2>/dev/null; then
+        [[ -n $TUI_PANE ]] && tmux send-keys -t "$TUI_PANE" q 2>/dev/null || true
+        sleep 2
+        tmux kill-session -t "$SESSION" 2>/dev/null || true
+    fi
+    return "$harness_status"
+}
+
+shell_command() {
+    local command_string
+    printf -v command_string '%q ' "$@"
+    printf '%s\n' "${command_string% }"
+}
+
+tmux_setup_failure() {
+    local operation=$1
+
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    write_state ABORTED tmux-setup
+    printf '1\n' > "$RUN_DIR/exit-code"
+    die "tmux setup failed: $operation"
+}
+
+launch_tmux() {
+    local tui_command
+    local worker_command
+    local journal_command
+    local window_target
+    local worker_arguments
+    local launcher_starttime
+
+    launcher_starttime=$(process_starttime "$$") || die 'cannot read launcher process identity'
+
+    tui_command=$(shell_command s-tui --csv --csv-file \
+        "$RUN_DIR/telemetry/s-tui.csv" --refresh-rate "$REFRESH_RATE" \
+        --t_thresh "$TEMPERATURE_THRESHOLD")
+    journal_command="sudo journalctl -kf -o short-iso 2>&1 | tee -a $(printf '%q' "$RUN_DIR/live-kernel.log")"
+
+    window_target=$(tmux new-session -d -P -F '#{session_name}:#{window_index}' \
+        -s "$SESSION" -x 140 -y 40 "$tui_command") ||
+        tmux_setup_failure 'create session'
+    TUI_PANE=$(tmux display-message -p -t "$window_target" '#{pane_id}') ||
+        tmux_setup_failure 'locate monitoring pane'
+    [[ -n $window_target && -n $TUI_PANE ]] || tmux_setup_failure 'locate monitoring pane'
+    worker_arguments=(
+        "$RUN_DIR" "$MODE" "$CPU_DURATION" "$CORE_DURATION"
+        "$CACHE_DURATION" "$VM_DURATION" "$MEMORY_PERCENT" "$REFRESH_RATE"
+        "$TEMPERATURE_THRESHOLD" "$CPU_LIST" "$SESSION" "$STARTED_AT" "$TUI_PANE" "$$"
+        "$launcher_starttime"
+    )
+    worker_command=$(shell_command bash -c '
+        session=$1
+        shift
+        "$@"
+        status=$?
+        tmux kill-session -t "$session" >/dev/null 2>&1 || true
+        exit "$status"
+    ' stress-uv-tmux "$SESSION" "$SCRIPT_PATH" __worker "${worker_arguments[@]}")
+    WORKER_PANE=$(tmux split-window -P -F '#{pane_id}' -h \
+        -t "$window_target" "$worker_command") ||
+        tmux_setup_failure 'create worker pane'
+    [[ -n $WORKER_PANE ]] || tmux_setup_failure 'create worker pane'
+    tmux split-window -v -t "$WORKER_PANE" "$journal_command" ||
+        tmux_setup_failure 'create journal pane'
+    tmux select-layout -t "$window_target" tiled >/dev/null ||
+        tmux_setup_failure 'select layout'
+    tmux select-pane -t "$TUI_PANE" ||
+        tmux_setup_failure 'select monitoring pane'
+    tmux set-option -t "$SESSION" status-right "stress-uv $MODE | $RUN_DIR" >/dev/null ||
+        tmux_setup_failure 'set status line'
+
+    printf 'Run directory: %s\n' "$RUN_DIR"
+    printf 'tmux session: %s\n' "$SESSION"
+    printf 'Detach without stopping: Ctrl-b d\n'
+    if ! tmux attach-session -t "$SESSION"; then
+        tmux send-keys -t "$WORKER_PANE" C-c 2>/dev/null || true
+        sleep 1
+        tmux kill-session -t "$SESSION" 2>/dev/null || true
+        return 1
+    fi
+
+    if tmux has-session -t "$SESSION" 2>/dev/null; then
+        : > "$RUN_DIR/launcher-detached"
+        printf 'Run continues in tmux session %s\n' "$SESSION"
+        printf 'Reattach with: tmux attach-session -t %q\n' "$SESSION"
+        return 0
+    fi
+
+    [[ -f $RUN_DIR/summary.txt ]] && cat "$RUN_DIR/summary.txt"
+    [[ -r $RUN_DIR/exit-code ]] && return "$(< "$RUN_DIR/exit-code")"
+    return 1
+}
+
+confirm_run() {
+    (( ASSUME_YES == 1 )) && return
+    [[ -t 0 ]] || die 'refusing to start a stress run without a terminal; pass --yes'
+
+    print_plan
+    printf '\nThis workload can expose instability and may crash or reboot the host.\n'
+    read -r -p 'Type RUN to continue: ' answer
+    [[ $answer == RUN ]] || die 'cancelled'
+}
+
+preflight() {
+    command_exists stress-ng || die 'stress-ng is required'
+    command_exists sudo || die 'sudo is required'
+    command_exists setsid || die 'setsid is required'
+    if (( NO_TUI == 0 )); then
+        command_exists tmux || die 'tmux is required unless --no-tui is used'
+        command_exists s-tui || die 's-tui is required unless --no-tui is used'
+        [[ -t 0 && -t 1 ]] || die 'interactive mode requires a terminal; use --no-tui'
+    fi
+    sudo -v || die 'sudo authentication failed'
+}
+
+create_run() {
+    local timestamp
+
+    timestamp=$(date '+%Y%m%d-%H%M%S')
+    mkdir -p -- "$OUTPUT_ROOT"
+    RUN_DIR=$(readlink -m -- "$OUTPUT_ROOT/${timestamp}-${MODE}")
+    [[ ! -e $RUN_DIR ]] || die "run directory already exists: $RUN_DIR"
+    mkdir -p -- "$RUN_DIR/telemetry"
+    SESSION="stress-uv-${timestamp}-$$"
+    STARTED_AT=$(date --iso-8601=seconds)
+    : > "$RUN_DIR/stages.tsv"
+    write_expected_stages
+    write_state RUNNING created
+    collect_metadata
+}
+
+main() {
+    if (($# == 0)); then
+        usage
+        exit 2
+    fi
+
+    case $1 in
+        -h|--help)
+            usage
+            return
+            ;;
+        --version)
+            printf 'stress-uv %s\n' "$VERSION"
+            return
+            ;;
+        report)
+            (($# == 2)) || die 'usage: stress-uv report RUN_DIR'
+            report_run "$2"
+            return
+            ;;
+    esac
+
+    MODE=$1
+    shift
+    parse_options "$@"
+    [[ -n $CPU_LIST ]] || CPU_LIST=$(default_cpu_list)
+    expand_cpu_list "$CPU_LIST"
+    select_stages
+
+    if (( DRY_RUN == 1 )); then
+        print_plan
+        return
+    fi
+
+    confirm_run
+    preflight
+    create_run
+    if (( NO_TUI == 1 )); then
+        worker_main "$RUN_DIR" "$MODE" "$CPU_DURATION" "$CORE_DURATION" \
+            "$CACHE_DURATION" "$VM_DURATION" "$MEMORY_PERCENT" "$REFRESH_RATE" \
+            "$TEMPERATURE_THRESHOLD" "$CPU_LIST" "$SESSION" "$STARTED_AT" "" "" ""
+    else
+        launch_tmux
+    fi
+}
+
+if [[ ${1:-} == __privileged_supervisor ]]; then
+    shift
+    privileged_supervisor_main "$@"
+elif [[ ${1:-} == __root_supervisor ]]; then
+    shift
+    root_supervisor_main "$@"
+elif [[ ${1:-} == __worker ]]; then
+    shift
+    worker_main "$@"
+elif [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi
