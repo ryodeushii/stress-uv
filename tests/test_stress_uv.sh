@@ -13,6 +13,10 @@ setup() {
 }
 
 teardown() {
+    if [[ ${STRESS_UV_KEEP_TEST_TMP:-0} == 1 ]]; then
+        printf '# kept test directory: %s\n' "$TEST_TMP"
+        return
+    fi
     rm -rf -- "$TEST_TMP"
 }
 
@@ -91,9 +95,16 @@ wait_for_file() {
 wait_for_exit() {
     local pid=$1
     local attempt
+    local stat
+    local stat_tail
 
     for ((attempt = 0; attempt < 300; attempt++)); do
         kill -0 "$pid" 2>/dev/null || return 0
+        if [[ -r /proc/$pid/stat ]]; then
+            stat=$(< "/proc/$pid/stat")
+            stat_tail=${stat##*) }
+            [[ ${stat_tail%% *} == Z ]] && return 0
+        fi
         sleep 0.02
     done
     return 1
@@ -127,6 +138,9 @@ run_test() {
     shift
     local failures_before
 
+    if [[ -n ${STRESS_UV_TEST_FILTER:-} && $name != *"$STRESS_UV_TEST_FILTER"* ]]; then
+        return
+    fi
     TESTS_RUN=$((TESTS_RUN + 1))
     failures_before=$TESTS_FAILED
     setup
@@ -145,11 +159,15 @@ test_help_lists_suites_and_stages() {
     assert_contains "$output" 'cpu-transition'
     assert_contains "$output" 'cpu-core-cycle'
     assert_contains "$output" 'memory-cache'
+    assert_contains "$output" 'memory-stressapptest'
+    assert_contains "$output" 'memory-memtester'
     assert_contains "$output" 'memory-vm'
     assert_contains "$output" 'benchmark'
     assert_contains "$output" '--benchmark-duration'
     assert_contains "$output" '--benchmark-warmup'
     assert_contains "$output" '--benchmark-runs'
+    assert_contains "$output" '--stressapptest-duration'
+    assert_contains "$output" '--memtester-loops'
     assert_contains "$output" 'compare BASELINE_RUN CANDIDATE_RUN'
     assert_contains "$output" 'report RUN_DIR'
 }
@@ -201,10 +219,32 @@ test_all_dry_run_orders_cpu_before_memory() {
         'STAGE cpu-transition' \
         'STAGE cpu-core-cycle cpu=0' \
         'STAGE memory-cache' \
+        'STAGE memory-stressapptest' \
+        'STAGE memory-memtester' \
         'STAGE memory-vm'
     assert_contains "$output" 'MEMORY target=85%'
     assert_contains "$output" '--vm-bytes '
     assert_not_contains "$output" '--vm-bytes 85%'
+}
+
+test_memory_dry_run_uses_stressapptest_and_memtester_sequentially() {
+    local output
+
+    mkdir -p "$TEST_TMP/proc/self"
+    printf 'MemAvailable:    1048576 kB\n' > "$TEST_TMP/proc/meminfo"
+
+    output=$(STRESS_UV_PROC_ROOT="$TEST_TMP/proc" \
+        "$HARNESS" memory --dry-run --cpu-list 0-1 --memory-percent 50 \
+        --cache-duration 1s --stressapptest-duration 30s \
+        --memtester-loops 2 --vm-duration 1s)
+
+    assert_order "$output" \
+        'STAGE memory-cache' \
+        'STAGE memory-stressapptest' \
+        'STAGE memory-memtester' \
+        'STAGE memory-vm'
+    assert_contains "$output" 'stressapptest -s 30 -M 512 -m 2 -W --max_errors 1'
+    assert_contains "$output" 'memtester 512M 2'
 }
 
 test_vm_allocation_respects_cgroup_v2_headroom() {
@@ -425,28 +465,66 @@ create_mock_tools() {
 
     cat > "$TEST_TMP/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
-if [[ ${1:-} == -v ]]; then exit 0; fi
-if [[ ${1:-} == -- ]]; then shift; fi
-if [[ -n ${SUDO_FORK_DELAY:-} && " $* " == *' __root_supervisor '* ]]; then
-    if [[ ${SUDO_CHILD_IGNORE_TERM:-0} == 1 ]]; then
-        (trap '' TERM INT HUP; sleep "$SUDO_FORK_DELAY"; exec "$@") &
-    else
-        (sleep "$SUDO_FORK_DELAY"; exec "$@") &
+original_args=$*
+noninteractive=0
+validate=0
+askpass=0
+while (($#)); do
+    case $1 in
+        -A) askpass=1; shift ;;
+        -n) noninteractive=1; shift ;;
+        -v) validate=1; shift ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+if [[ -n ${SUDO_COMMAND_LOG:-} ]]; then
+    printf 'validate=%s noninteractive=%s askpass=%s args=%s\n' \
+        "$validate" "$noninteractive" "$askpass" "$original_args" >> "$SUDO_COMMAND_LOG"
+fi
+if (( validate == 1 && askpass == 1 )) && [[ ${SUDO_ASKPASS_FAIL:-0} == 1 ]]; then
+    exit 1
+fi
+if [[ ${SUDO_TTY_TICKETS:-0} == 1 ]]; then
+    tty_key=$(ps -o tty= -p "$$" | tr -d ' ')
+    [[ -n $tty_key && $tty_key != '?' ]] || tty_key=none
+    marker="$SUDO_TIMESTAMP_DIR/${tty_key//\//_}"
+    if (( validate == 1 )); then
+        if (( noninteractive == 0 )); then
+            [[ $tty_key != none ]] || exit 1
+            : > "$marker"
+            printf 'validate tty=%s auth=created\n' "$tty_key" >> "$SUDO_LOG"
+            exit 0
+        fi
+        if [[ -e $marker ]]; then
+            printf 'validate tty=%s auth=hit\n' "$tty_key" >> "$SUDO_LOG"
+            exit 0
+        fi
+        printf 'validate tty=%s auth=miss\n' "$tty_key" >> "$SUDO_LOG"
+        exit 1
     fi
-    child_pid=$!
-    child_pid_file=${SUDO_CHILD_PID_FILE:-}
-    if [[ " $* " == *' turbostat '* && -n ${SUDO_TURBOSTAT_CHILD_PID_FILE:-} ]]; then
-        child_pid_file=$SUDO_TURBOSTAT_CHILD_PID_FILE
-    elif [[ " $* " == *' stress-ng '* && -n ${SUDO_STRESS_CHILD_PID_FILE:-} ]]; then
-        child_pid_file=$SUDO_STRESS_CHILD_PID_FILE
+    if [[ ! -e $marker ]]; then
+        printf 'command tty=%s noninteractive=%s auth=miss args=%s\n' \
+            "$tty_key" "$noninteractive" "$*" >> "$SUDO_LOG"
+        printf 'sudo: a password is required\n' >&2
+        exit 1
     fi
-    [[ -n $child_pid_file ]] && printf '%s\n' "$child_pid" > "$child_pid_file"
-    wait "$child_pid"
-    exit $?
+    printf 'command tty=%s noninteractive=%s auth=hit args=%s\n' \
+        "$tty_key" "$noninteractive" "$*" >> "$SUDO_LOG"
+elif (( validate == 1 )); then
+    exit 0
+fi
+if [[ ${SUDO_REJECT_AFTER_BROKER:-0} == 1 && -e ${SUDO_BROKER_MARKER:-/nonexistent} &&
+    " $* " != *' __broker '* ]]; then
+    printf 'sudo: cached credential expired\n' >&2
+    exit 1
+fi
+if [[ ${SUDO_REJECT_AFTER_BROKER:-0} == 1 && " $* " == *' __broker '* ]]; then
+    : > "$SUDO_BROKER_MARKER"
 fi
 exec "$@"
 EOF
-cat > "$TEST_TMP/bin/stress-ng" <<'EOF'
+    cat > "$TEST_TMP/bin/stress-ng" <<'EOF'
 #!/usr/bin/env bash
 if [[ ${1:-} == --version ]]; then
     printf 'stress-ng mock 1.0\n'
@@ -461,13 +539,13 @@ if [[ ${STRESS_NG_BLOCK:-0} == 1 ]]; then
     trap 'printf "terminated\n" > "$STRESS_NG_TERM_FILE"; exit 143' TERM INT HUP
     while :; do sleep 1; done
 fi
-case $log_file in
-    *benchmark-single-run-1.log) values='100 50' ;;
-    *benchmark-single-run-2.log) values='102 51' ;;
-    *benchmark-single-run-3.log) values='104 52' ;;
-    *benchmark-multi-run-1.log) values='800 400' ;;
-    *benchmark-multi-run-2.log) values='816 408' ;;
-    *benchmark-multi-run-3.log) values='832 416' ;;
+case ${STRESS_UV_STAGE_LABEL:-$log_file} in
+    *benchmark-single-run-1*) values='100 50' ;;
+    *benchmark-single-run-2*) values='102 51' ;;
+    *benchmark-single-run-3*) values='104 52' ;;
+    *benchmark-multi-run-1*) values='800 400' ;;
+    *benchmark-multi-run-2*) values='816 408' ;;
+    *benchmark-multi-run-3*) values='832 416' ;;
     *) values='' ;;
 esac
 if [[ -n $values && ${STRESS_NG_NO_METRICS:-0} != 1 ]]; then
@@ -477,7 +555,8 @@ if [[ -n $values && ${STRESS_NG_NO_METRICS:-0} != 1 ]]; then
         if [[ ${STRESS_NG_DUPLICATE_METRICS:-0} == 1 ]]; then
             printf 'stress-ng: metrc: [1] vecfp %s float128add Mfp-ops/sec (harmonic mean duplicate)\n' "$add_rate"
         fi
-        if [[ ${STRESS_NG_INCONSISTENT_METRICS:-0} != 1 || $log_file != *run-2.log ]]; then
+        if [[ ${STRESS_NG_INCONSISTENT_METRICS:-0} != 1 ||
+            ${STRESS_UV_STAGE_LABEL:-$log_file} != *run-2* ]]; then
             printf 'stress-ng: metrc: [1] vecfp %s float128mul Mfp-ops/sec (harmonic mean of 1 instance)\n' "$mul_rate"
         fi
     } | tee "$log_file"
@@ -485,6 +564,41 @@ if [[ -n $values && ${STRESS_NG_NO_METRICS:-0} != 1 ]]; then
 fi
 printf 'stress-ng mock completed\n' | tee "$log_file"
 exit "${STRESS_NG_EXIT:-0}"
+EOF
+    cat > "$TEST_TMP/bin/stressapptest" <<'EOF'
+#!/usr/bin/env bash
+printf 'stressapptest mock args:'
+printf ' %s' "$@"
+printf '\n'
+case ${STRESSAPPTEST_RESULT:-} in
+    hardware) printf 'Status: FAIL - test discovered HW problems\n' ;;
+    procedural) printf 'Status: FAIL - test encountered procedural errors\n' ;;
+esac
+exit "${STRESSAPPTEST_EXIT:-0}"
+EOF
+    cat > "$TEST_TMP/bin/memtester" <<'EOF'
+#!/usr/bin/env bash
+printf 'memtester mock args:'
+printf ' %s' "$@"
+printf '\n'
+exit "${MEMTESTER_EXIT:-0}"
+EOF
+    cat > "$TEST_TMP/bin/base64" <<'EOF'
+#!/usr/bin/env bash
+decode=0
+for argument in "$@"; do
+    [[ $argument == -d || $argument == --decode ]] && decode=1
+done
+if (( decode == 1 )) && [[ ${BASE64_DECODE_FAIL:-0} == 1 ]]; then
+    printf 'partial evidence'
+    exit 1
+fi
+if (( decode == 0 )) && [[ ${BASE64_ENCODE_FAIL:-0} == 1 && " $* " == *stage.log* ]]; then
+    encoded=$(/usr/bin/base64 "$@")
+    printf '%s\n' "${encoded:0:8}"
+    exit 1
+fi
+exec /usr/bin/base64 "$@"
 EOF
     cat > "$TEST_TMP/bin/turbostat" <<'EOF'
 #!/usr/bin/env bash
@@ -534,6 +648,148 @@ test_headless_stage_records_complete_pass() {
     assert_file_contains "$run_dir/stages.tsv" $'memory-cache\t0\tPASS'
     assert_file_contains "$run_dir/memory-cache.log" 'stress-ng mock completed'
     assert_file_contains "$run_dir/telemetry/turbostat.txt" 'PkgWatt'
+}
+
+test_headless_official_memory_stages_record_commands() {
+    local output
+    local run_dirs
+    local run_dir
+    local stressapp_log
+    local stressapp_mib
+    local memtester_log
+    local memtester_mib
+
+    create_mock_tools
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" "$HARNESS" memory \
+        --yes --no-tui --cache-duration 1s --stressapptest-duration 1s \
+        --memtester-loops 1 --vm-duration 1s --memory-percent 1 \
+        --cpu-list 0 --output "$TEST_TMP/runs")
+    run_dirs=("$TEST_TMP/runs"/*)
+    run_dir=${run_dirs[0]}
+
+    assert_contains "$output" 'Result: PASS'
+    assert_file_contains "$run_dir/stages.tsv" $'memory-stressapptest\t0\tPASS'
+    assert_file_contains "$run_dir/stages.tsv" $'memory-memtester\t0\tPASS'
+    stressapp_log=$(< "$run_dir/memory-stressapptest.log")
+    memtester_log=$(< "$run_dir/memory-memtester.log")
+    [[ $stressapp_log =~ ^stressapptest\ mock\ args:\ -s\ 1\ -M\ ([0-9]+)\ -m\ 1\ -W\ --max_errors\ 1$ ]] ||
+        fail 'stressapptest executed arguments were malformed'
+    stressapp_mib=${BASH_REMATCH[1]}
+    [[ $memtester_log =~ ^memtester\ mock\ args:\ ([0-9]+)M\ 1$ ]] ||
+        fail 'memtester executed arguments were malformed'
+    memtester_mib=${BASH_REMATCH[1]}
+    (( stressapp_mib > 0 && memtester_mib > 0 )) || fail 'memory allocation was not positive'
+}
+
+test_official_memory_errors_are_failures() {
+    local output
+    local run_dirs
+    local run_dir
+
+    create_mock_tools
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" STRESSAPPTEST_EXIT=1 \
+        STRESSAPPTEST_RESULT=hardware \
+        "$HARNESS" memory-stressapptest --yes --no-tui \
+        --stressapptest-duration 1s --memory-percent 1 --cpu-list 0 \
+        --output "$TEST_TMP/stressapp-runs")
+    run_dirs=("$TEST_TMP/stressapp-runs"/*)
+    run_dir=${run_dirs[0]}
+    assert_contains "$output" 'Result: FAIL'
+    assert_file_contains "$run_dir/stages.tsv" $'memory-stressapptest\t1\tFAIL'
+
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" STRESSAPPTEST_EXIT=1 \
+        STRESSAPPTEST_RESULT=procedural \
+        "$HARNESS" memory-stressapptest --yes --no-tui \
+        --stressapptest-duration 1s --memory-percent 1 --cpu-list 0 \
+        --output "$TEST_TMP/stressapp-procedural-runs")
+    run_dirs=("$TEST_TMP/stressapp-procedural-runs"/*)
+    run_dir=${run_dirs[0]}
+    assert_contains "$output" 'Result: INCONCLUSIVE'
+    assert_file_contains "$run_dir/stages.tsv" $'memory-stressapptest\t1\tERROR'
+
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" MEMTESTER_EXIT=4 \
+        "$HARNESS" memory-memtester --yes --no-tui \
+        --memtester-loops 1 --memory-percent 1 --cpu-list 0 \
+        --output "$TEST_TMP/memtester-runs")
+    run_dirs=("$TEST_TMP/memtester-runs"/*)
+    run_dir=${run_dirs[0]}
+    assert_contains "$output" 'Result: FAIL'
+    assert_file_contains "$run_dir/stages.tsv" $'memory-memtester\t4\tFAIL'
+}
+
+test_idle_broker_exits_when_worker_dies() {
+    local worker_pid
+    local worker_starttime
+    local broker_pid
+
+    create_mock_tools
+    mkfifo -m 600 "$TEST_TMP/broker-requests"
+    sleep 30 &
+    worker_pid=$!
+    worker_starttime=$(awk '{print $22}' "/proc/$worker_pid/stat")
+    PATH="$TEST_TMP/bin:/usr/bin:/bin" \
+        STRESS_UV_TEST_BROKER_TMP_PARENT="$TEST_TMP/broker-tmp" \
+        "$HARNESS" __broker cpu 1s 1s 1s 1s 1 1 0 \
+        '2026-01-01T00:00:00+00:00' 1s 1s 1 \
+        "$worker_pid" "$worker_starttime" "$(id -u)" \
+        "$TEST_TMP/broker-requests" 1s 1 > "$TEST_TMP/broker.out" 2>&1 &
+    broker_pid=$!
+    wait_for_file "$TEST_TMP/broker.out" || fail 'broker did not become ready'
+
+    kill -KILL "$worker_pid"
+    wait "$worker_pid" 2>/dev/null || true
+    if ! wait_for_exit "$broker_pid"; then
+        kill -KILL "$broker_pid" 2>/dev/null || true
+        fail 'idle broker survived worker death'
+    fi
+    wait "$broker_pid" 2>/dev/null || true
+}
+
+test_malformed_shutdown_acknowledgement_forces_broker_stop() {
+    local output
+
+    output=$(bash -c '
+        source "$1"
+        sleep 30 &
+        fake_pid=$!
+        BROKER_PID=$fake_pid
+        BROKER_STARTTIME=$(process_starttime "$fake_pid")
+        exec {BROKER_IN_FD}>/dev/null
+        exec {BROKER_OUT_FD}< <(printf "BAD\\t1\\n")
+        stop_privileged_broker
+        result=$?
+        if process_is_running "$fake_pid"; then alive=1; else alive=0; fi
+        printf "result=%s alive=%s\\n" "$result" "$alive"
+        wait "$fake_pid" 2>/dev/null || true
+    ' stress-uv-test "$HARNESS")
+
+    assert_contains "$output" 'result=1 alive=0'
+}
+
+test_broker_teardown_does_not_signal_reused_pid() {
+    local output
+
+    output=$(bash -c '
+        source "$1"
+        unrelated_pid=$(bash -c "sleep 30 >/dev/null 2>&1 & printf %s \$!")
+        BROKER_PID=$unrelated_pid
+        BROKER_STARTTIME=$(( $(process_starttime "$unrelated_pid") + 1 ))
+        BROKER_IN_FD=""
+        BROKER_OUT_FD=""
+        stop_privileged_broker >/dev/null 2>&1
+        stop_result=$?
+        if kill -0 "$unrelated_pid" 2>/dev/null; then stop_alive=1; else stop_alive=0; fi
+
+        BROKER_PID=$unrelated_pid
+        BROKER_STARTTIME=$(( $(process_starttime "$unrelated_pid") + 1 ))
+        cancel_privileged_broker >/dev/null 2>&1
+        if kill -0 "$unrelated_pid" 2>/dev/null; then cancel_alive=1; else cancel_alive=0; fi
+        printf "stop=%s stop_alive=%s cancel_alive=%s\\n" \
+            "$stop_result" "$stop_alive" "$cancel_alive"
+        kill -TERM "$unrelated_pid" 2>/dev/null || true
+    ' stress-uv-test "$HARNESS")
+
+    assert_contains "$output" 'stop=1 stop_alive=1 cancel_alive=1'
 }
 
 test_headless_benchmark_writes_metrics_and_summary() {
@@ -814,99 +1070,113 @@ test_signal_stops_stressor_and_marks_run_aborted() {
     assert_file_contains "$run_dir/state" 'status=ABORTED'
 }
 
-test_signal_during_sudo_handoff_stops_delayed_child() {
+test_worker_sigkill_does_not_orphan_stressor() {
     local harness_pid
-    local stress_child_pid
-    local turbostat_child_pid
-    local stress_child_was_alive=0
-    local turbostat_child_was_alive=0
+    local stress_pid
+
+    create_mock_tools
+    PATH="$TEST_TMP/bin:/usr/bin:/bin" \
+        STRESS_NG_BLOCK=1 \
+        STRESS_NG_PID_FILE="$TEST_TMP/stress.pid" \
+        STRESS_NG_TERM_FILE="$TEST_TMP/stress.term" \
+        "$HARNESS" cpu-sustained --yes --no-tui --cpu-duration 1s \
+        --cpu-list 0 --output "$TEST_TMP/runs" \
+        > "$TEST_TMP/harness.out" 2>&1 &
+    harness_pid=$!
+
+    if ! wait_for_file "$TEST_TMP/stress.pid"; then
+        kill -KILL "$harness_pid" 2>/dev/null || true
+        wait "$harness_pid" 2>/dev/null || true
+        fail 'mock stressor did not start'
+        return
+    fi
+    stress_pid=$(< "$TEST_TMP/stress.pid")
+    kill -KILL "$harness_pid"
+    wait "$harness_pid" 2>/dev/null || true
+
+    if ! wait_for_exit "$stress_pid"; then
+        kill -KILL "$stress_pid" 2>/dev/null || true
+        fail 'stress process survived worker SIGKILL'
+    fi
+    [[ -f $TEST_TMP/stress.term ]] || fail 'broker did not terminate stressor after worker SIGKILL'
+}
+
+test_run_uses_one_persistent_privileged_broker() {
+    local output
+    local sudo_log
+    local command_count
     local run_dirs
     local run_dir
 
     create_mock_tools
-    PATH="$TEST_TMP/bin:/usr/bin:/bin" \
-        SUDO_FORK_DELAY=5 \
-        SUDO_CHILD_IGNORE_TERM=1 \
-        SUDO_STRESS_CHILD_PID_FILE="$TEST_TMP/stress-sudo-child.pid" \
-        SUDO_TURBOSTAT_CHILD_PID_FILE="$TEST_TMP/turbostat-sudo-child.pid" \
-        "$HARNESS" cpu-sustained --yes --no-tui --cpu-duration 1s \
-        --cpu-list 0 --output "$TEST_TMP/runs" \
-        > "$TEST_TMP/handoff.out" 2>&1 &
-    harness_pid=$!
-
-    if ! wait_for_file "$TEST_TMP/stress-sudo-child.pid" ||
-        ! wait_for_file "$TEST_TMP/turbostat-sudo-child.pid"; then
-        kill -KILL "$harness_pid" 2>/dev/null || true
-        wait "$harness_pid" 2>/dev/null || true
-        fail 'delayed stress or turbostat sudo child did not start'
-        return
-    fi
-    stress_child_pid=$(< "$TEST_TMP/stress-sudo-child.pid")
-    turbostat_child_pid=$(< "$TEST_TMP/turbostat-sudo-child.pid")
-    kill -TERM "$harness_pid"
-    wait_for_exit "$harness_pid" || kill -KILL "$harness_pid" 2>/dev/null || true
-    wait "$harness_pid" 2>/dev/null || true
-
-    if kill -0 "$stress_child_pid" 2>/dev/null; then
-        stress_child_was_alive=1
-        kill -TERM "$stress_child_pid" 2>/dev/null || true
-    fi
-    if kill -0 "$turbostat_child_pid" 2>/dev/null; then
-        turbostat_child_was_alive=1
-        kill -TERM "$turbostat_child_pid" 2>/dev/null || true
-    fi
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" \
+        SUDO_COMMAND_LOG="$TEST_TMP/sudo-commands.log" \
+        SUDO_REJECT_AFTER_BROKER=1 \
+        SUDO_BROKER_MARKER="$TEST_TMP/broker-started" \
+        "$HARNESS" memory-cache --yes --no-tui --cache-duration 1s \
+        --cpu-list 0 --output "$TEST_TMP/runs")
     run_dirs=("$TEST_TMP/runs"/*)
     run_dir=${run_dirs[0]}
-    assert_equals "$stress_child_was_alive" 0
-    assert_equals "$turbostat_child_was_alive" 0
-    assert_file_contains "$run_dir/state" 'status=ABORTED'
+    sudo_log=$(< "$TEST_TMP/sudo-commands.log")
+    command_count=$(grep -c '^validate=0 ' "$TEST_TMP/sudo-commands.log")
+
+    assert_contains "$output" 'Result: PASS'
+    assert_equals "$command_count" 1
+    assert_contains "$sudo_log" 'args=-n --'
+    assert_contains "$sudo_log" '__broker'
+    assert_not_contains "$sudo_log" 'args=-- setsid'
+    assert_file_contains "$run_dir/state" 'status=COMPLETE'
 }
 
-test_real_sudo_cleanup_crosses_privilege_boundary_when_enabled() {
+test_broker_transfer_failures_cannot_leave_accepted_evidence() {
     local output
+    local run_dirs
+    local run_dir
 
-    [[ ${STRESS_UV_TEST_ROOT_CLEANUP:-0} == 1 ]] || return 0
-    sudo -n true 2>/dev/null || {
-        fail 'STRESS_UV_TEST_ROOT_CLEANUP=1 requires cached passwordless sudo'
-        return
-    }
+    create_mock_tools
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" BASE64_ENCODE_FAIL=1 \
+        "$HARNESS" cpu-sustained --yes --no-tui --cpu-duration 1s \
+        --cpu-list 0 --output "$TEST_TMP/encode-runs" 2>&1)
+    run_dirs=("$TEST_TMP/encode-runs"/*)
+    run_dir=${run_dirs[0]}
+    assert_not_contains "$output" 'Result: PASS'
+    [[ ! -s $run_dir/cpu-sustained.log ]] || fail 'partial encoded stage log survived'
 
-    output=$(bash -c '
-        source "$1"
-        test_dir=$2
-        outer_file=$test_dir/root-outer.pid
-        inner_file=$test_dir/root-inner.pid
-        child_file=$test_dir/root-child.pid
-        : > "$outer_file"
-        : > "$inner_file"
-        setsid "$SCRIPT_PATH" __privileged_supervisor "$outer_file" "$inner_file" \
-            bash -c '\''
-                printf "%s\n" "$$" > "$1"
-                trap "" INT TERM HUP
-                while :; do sleep 1; done
-            '\'' stress-uv-root-child "$child_file" &
-        wrapper_pid=$!
-        for ((attempt = 0; attempt < 100; attempt++)); do
-            [[ -s $child_file ]] && break
-            sleep 0.02
-        done
-        [[ -s $child_file ]] || exit 2
-        read -r child_pid < "$child_file"
-        while read -r key real_uid rest; do
-            [[ $key == Uid: ]] && break
-        done < "/proc/$child_pid/status"
-        printf "root_uid=%s\n" "$real_uid"
-        terminate_supervised_command "$wrapper_pid" "$outer_file" "$inner_file"
-        if kill -0 "$child_pid" 2>/dev/null; then
-            sudo -n kill -KILL "$child_pid" 2>/dev/null || true
-            printf "child=leaked\n"
-            exit 3
-        fi
-        printf "child=stopped\n"
-    ' stress-uv-test "$HARNESS" "$TEST_TMP")
+    create_mock_tools
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" BASE64_DECODE_FAIL=1 \
+        "$HARNESS" cpu-sustained --yes --no-tui --cpu-duration 1s \
+        --cpu-list 0 --output "$TEST_TMP/decode-runs" 2>&1)
+    run_dirs=("$TEST_TMP/decode-runs"/*)
+    run_dir=${run_dirs[0]}
+    assert_not_contains "$output" 'Result: PASS'
+    [[ ! -s $run_dir/cpu-sustained.log ]] || fail 'partial decoded stage log survived'
+}
 
-    assert_contains "$output" 'root_uid=0'
-    assert_contains "$output" 'child=stopped'
+test_authentication_uses_configured_askpass_with_terminal_fallback() {
+    local output
+    local sudo_log
+
+    create_mock_tools
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$TEST_TMP/askpass"
+    chmod +x "$TEST_TMP/askpass"
+    PATH="$TEST_TMP/bin:/usr/bin:/bin" \
+        SUDO_ASKPASS="$TEST_TMP/askpass" \
+        SUDO_COMMAND_LOG="$TEST_TMP/sudo-commands.log" \
+        bash -c 'source "$1"; authenticate_sudo' stress-uv-test "$HARNESS" >/dev/null
+    sudo_log=$(< "$TEST_TMP/sudo-commands.log")
+    assert_contains "$sudo_log" 'askpass=1 args=-A -v'
+    assert_not_contains "$sudo_log" 'askpass=0 args=-v'
+
+    : > "$TEST_TMP/sudo-commands.log"
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" \
+        SUDO_ASKPASS="$TEST_TMP/askpass" \
+        SUDO_ASKPASS_FAIL=1 \
+        SUDO_COMMAND_LOG="$TEST_TMP/sudo-commands.log" \
+        bash -c 'source "$1"; authenticate_sudo' stress-uv-test "$HARNESS")
+    sudo_log=$(< "$TEST_TMP/sudo-commands.log")
+    assert_contains "$output" 'falling back to the terminal'
+    assert_contains "$sudo_log" 'askpass=1 args=-A -v'
+    assert_contains "$sudo_log" 'askpass=0 args=-v'
 }
 
 test_process_identity_rejects_zombies_and_pid_reuse() {
@@ -932,20 +1202,11 @@ test_process_identity_rejects_zombies_and_pid_reuse() {
         write_stat R 124
         process_matches_identity "$$" 123 || printf "reused=dead\n"
 
-        kill() { printf "%s\n" "$*" >> "$PROC_ROOT/signals"; }
-        printf "%s %s\n" "$$" 123 > "$PROC_ROOT/stale-record"
-        signal_recorded_group TERM "$PROC_ROOT/stale-record" 0
-        [[ ! -e $PROC_ROOT/signals ]] && printf "stale=skipped\n"
-        printf "%s %s\n" "$$" 124 > "$PROC_ROOT/current-record"
-        signal_recorded_group TERM "$PROC_ROOT/current-record" 0
-        [[ -s $PROC_ROOT/signals ]] && printf "current=signaled\n"
     ' stress-uv-test "$HARNESS" "$TEST_TMP/proc")
 
     assert_contains "$output" 'matching=alive'
     assert_contains "$output" 'zombie=dead'
     assert_contains "$output" 'reused=dead'
-    assert_contains "$output" 'stale=skipped'
-    assert_contains "$output" 'current=signaled'
 }
 
 test_launcher_detach_marker_allows_worker_to_continue() {
@@ -1044,6 +1305,46 @@ EOF
     assert_contains "$output" 'Result: PASS'
 }
 
+test_tmux_authenticates_worker_tty_before_privileged_commands() {
+    local command
+    local output
+    local sudo_log
+
+    create_mock_tools
+    mkdir -m 700 "$TEST_TMP/tmux" "$TEST_TMP/sudo-timestamps"
+    cat > "$TEST_TMP/bin/s-tui" <<'EOF'
+#!/usr/bin/env bash
+if [[ ${1:-} == --version ]]; then printf 's-tui mock 1.0\n'; exit 0; fi
+trap 'exit 0' INT TERM HUP
+while :; do sleep 1; done
+EOF
+    chmod +x "$TEST_TMP/bin/s-tui"
+    printf -v command '%q ' env \
+        "PATH=$TEST_TMP/bin:/usr/bin:/bin" \
+        "TMUX=" \
+        "TMUX_TMPDIR=$TEST_TMP/tmux" \
+        "TERM=xterm-256color" \
+        SUDO_TTY_TICKETS=1 \
+        "SUDO_TIMESTAMP_DIR=$TEST_TMP/sudo-timestamps" \
+        "SUDO_LOG=$TEST_TMP/sudo.log" \
+        "$HARNESS" benchmark --yes --benchmark-duration 1s \
+        --benchmark-warmup 1s --benchmark-runs 1 --cpu-list 0 \
+        --output "$TEST_TMP/runs"
+
+    output=$(TERM=xterm-256color TMUX= TMUX_TMPDIR="$TEST_TMP/tmux" \
+        script -qec "${command% }" /dev/null 2>&1)
+    TMUX= TMUX_TMPDIR="$TEST_TMP/tmux" tmux kill-server 2>/dev/null || true
+    sudo_log=$(< "$TEST_TMP/sudo.log")
+
+    assert_contains "$output" 'Result: PASS'
+    assert_not_contains "$output" 'a terminal is required'
+    assert_not_contains "$output" 'a password is required'
+    assert_contains "$sudo_log" 'validate tty=pts/'
+    assert_contains "$sudo_log" 'noninteractive=1 auth=hit'
+    assert_not_contains "$sudo_log" 'auth=miss'
+    assert_not_contains "$sudo_log" 'tty=none'
+}
+
 test_signal_to_tmux_launcher_aborts_session_and_stressor() {
     local command
     local script_pid
@@ -1131,6 +1432,7 @@ run_test 'help lists suites and stages' test_help_lists_suites_and_stages
 run_test 'benchmark plan uses repeated vecfp runs' test_benchmark_dry_run_uses_vecfp_repetitions
 run_test 'CPU plan is sequential and cycles each CPU' test_cpu_dry_run_is_sequential_and_cycles_each_cpu
 run_test 'all plan runs CPU before memory' test_all_dry_run_orders_cpu_before_memory
+run_test 'memory plan uses official tools sequentially' test_memory_dry_run_uses_stressapptest_and_memtester_sequentially
 run_test 'VM allocation respects cgroup v2 headroom' test_vm_allocation_respects_cgroup_v2_headroom
 run_test 'VM allocation respects cgroup v1 headroom' test_vm_allocation_respects_cgroup_v1_headroom
 run_test 'VM allocation respects cgroup v2 ancestor limit' test_vm_allocation_respects_cgroup_v2_ancestor_limit
@@ -1145,6 +1447,8 @@ run_test 'report rejects duplicate and malformed stage records' test_report_reje
 run_test 'report rejects exit and verdict contradictions' test_report_rejects_exit_verdict_contradictions
 run_test 'report exit status matches verdict' test_report_exit_status_matches_verdict
 run_test 'headless stage records a complete passing run' test_headless_stage_records_complete_pass
+run_test 'headless official memory stages record commands' test_headless_official_memory_stages_record_commands
+run_test 'official memory errors are failures' test_official_memory_errors_are_failures
 run_test 'headless benchmark writes metrics and summary' test_headless_benchmark_writes_metrics_and_summary
 run_test 'headless benchmark rejects inconsistent metric sets' test_headless_benchmark_rejects_inconsistent_metric_sets
 run_test 'headless benchmark rejects missing metrics' test_headless_benchmark_rejects_missing_metrics
@@ -1157,12 +1461,18 @@ run_test 'compare rejects invalid summary contract' test_compare_rejects_invalid
 run_test 'compare rejects disjoint scope metrics' test_compare_rejects_disjoint_scope_metrics
 run_test 'headless stage propagates stressor failure' test_headless_stage_propagates_stressor_failure
 run_test 'signals stop stressor and mark run aborted' test_signal_stops_stressor_and_marks_run_aborted
-run_test 'signals during sudo handoff stop delayed child' test_signal_during_sudo_handoff_stops_delayed_child
-run_test 'real sudo cleanup crosses privilege boundary when enabled' test_real_sudo_cleanup_crosses_privilege_boundary_when_enabled
+run_test 'worker SIGKILL does not orphan stressor' test_worker_sigkill_does_not_orphan_stressor
+run_test 'idle broker exits when worker dies' test_idle_broker_exits_when_worker_dies
+run_test 'malformed shutdown acknowledgement forces broker stop' test_malformed_shutdown_acknowledgement_forces_broker_stop
+run_test 'broker teardown does not signal reused PID' test_broker_teardown_does_not_signal_reused_pid
+run_test 'run uses one persistent privileged broker' test_run_uses_one_persistent_privileged_broker
+run_test 'broker transfer failures cannot leave accepted evidence' test_broker_transfer_failures_cannot_leave_accepted_evidence
+run_test 'authentication uses askpass with terminal fallback' test_authentication_uses_configured_askpass_with_terminal_fallback
 run_test 'process identity rejects zombies and PID reuse' test_process_identity_rejects_zombies_and_pid_reuse
 run_test 'launcher detach marker lets worker continue' test_launcher_detach_marker_allows_worker_to_continue
 run_test 'tmux setup failure rolls back session' test_tmux_setup_failure_rolls_back_session
 run_test 'tmux benchmark supports nonzero base indices' test_tmux_benchmark_supports_nonzero_window_and_pane_base_indices
+run_test 'tmux authenticates worker tty before privileged commands' test_tmux_authenticates_worker_tty_before_privileged_commands
 run_test 'signals to tmux launcher abort session and stressor' test_signal_to_tmux_launcher_aborts_session_and_stressor
 
 printf '1..%d\n' "$TESTS_RUN"

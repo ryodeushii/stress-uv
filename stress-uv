@@ -3,7 +3,7 @@
 set -u
 umask 077
 
-VERSION=0.2.0
+VERSION=0.3.0
 SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
 PROC_ROOT=${STRESS_UV_PROC_ROOT:-/proc}
 CGROUP_ROOT=${STRESS_UV_CGROUP_ROOT:-/sys/fs/cgroup}
@@ -17,6 +17,8 @@ CPU_LIST=""
 CPU_DURATION=20m
 CORE_DURATION=1m
 CACHE_DURATION=20m
+STRESSAPPTEST_DURATION=2h
+MEMTESTER_LOOPS=1
 VM_DURATION=3h
 BENCHMARK_DURATION=60s
 BENCHMARK_WARMUP=15s
@@ -32,16 +34,14 @@ LAUNCHER_PID=""
 LAUNCHER_STARTTIME=""
 LAUNCHER_WATCHER_PID=""
 STARTED_AT=""
-TURBOSTAT_PID=""
-TURBOSTAT_OUTER_PGID_FILE=""
-TURBOSTAT_INNER_PGID_FILE=""
-ACTIVE_STAGE_WRAPPER_PID=""
-ACTIVE_STAGE_OUTER_PGID_FILE=""
-ACTIVE_STAGE_INNER_PGID_FILE=""
+BROKER_PID=""
+BROKER_STARTTIME=""
+BROKER_IN_FD=""
+BROKER_OUT_FD=""
+BROKER_REQUEST_PATH=""
 CURRENT_STAGE=""
 WORKER_FINISHED=0
 WORKER_CLEANING_UP=0
-SUPERVISED_CHILD_PID=""
 STAGE_COMMAND=()
 CPUS=()
 SELECTED_STAGES=()
@@ -64,6 +64,9 @@ Individual stages:
   cpu-transition      Repeated 50% load transitions.
   cpu-core-cycle      Pin one worker to each selected logical CPU.
   memory-cache        Exercise the selected cache level.
+  memory-stressapptest
+                      Run stressapptest against a bounded RAM allocation.
+  memory-memtester    Run memtester against a bounded RAM allocation.
   memory-vm           Verify writes across a bounded memory allocation.
 
 Options:
@@ -71,6 +74,9 @@ Options:
   --cpu-duration TIME      Sustained/transition duration (default: 20m).
   --core-duration TIME     Duration per logical CPU (default: 1m).
   --cache-duration TIME    Cache stage duration (default: 20m).
+  --stressapptest-duration TIME
+                            stressapptest duration (default: 2h).
+  --memtester-loops N      memtester passes (default: 1).
   --vm-duration TIME       VM stage duration (default: 3h).
   --benchmark-duration TIME
                             Duration per measured benchmark run (default: 60s).
@@ -87,8 +93,9 @@ Options:
   -h, --help               Show this help.
   --version                Show the version.
 
-The harness requires stress-ng and sudo. Interactive mode also requires tmux
-and s-tui. turbostat and sensors are optional telemetry sources.
+The harness requires stress-ng, sudo, setsid, and base64. Memory modes also
+require stressapptest or memtester when their stages are selected. Interactive
+mode requires tmux and s-tui. turbostat and sensors are optional telemetry.
 EOF
 }
 
@@ -104,6 +111,28 @@ command_exists() {
 validate_duration() {
     [[ $1 =~ ^[1-9][0-9]*([.][0-9]+)?[smhdy]$ ]] ||
         die "invalid duration '$1'; use values such as 30s, 20m, or 3h"
+}
+
+duration_seconds() {
+    local duration=$1
+    local value
+    local unit
+    local multiplier
+
+    [[ $duration =~ ^([1-9][0-9]*([.][0-9]+)?)([smhdy])$ ]] ||
+        die "invalid duration '$duration'"
+    value=${BASH_REMATCH[1]}
+    unit=${BASH_REMATCH[3]}
+    case $unit in
+        s) multiplier=1 ;;
+        m) multiplier=60 ;;
+        h) multiplier=3600 ;;
+        d) multiplier=86400 ;;
+        y) multiplier=31536000 ;;
+        *) die "invalid duration unit '$unit'" ;;
+    esac
+    awk -v value="$value" -v multiplier="$multiplier" \
+        'BEGIN { seconds = value * multiplier; printf "%d\n", int(seconds) < seconds ? int(seconds) + 1 : seconds }'
 }
 
 validate_integer_range() {
@@ -256,7 +285,7 @@ available_memory_mib() {
     fi
 }
 
-vm_bytes_total_mib() {
+memory_target_mib() {
     local workers=$1
     local available_mib
     local total_mib
@@ -278,15 +307,16 @@ select_stages() {
             SELECTED_STAGES=(cpu-sustained cpu-transition cpu-core-cycle)
             ;;
         memory)
-            SELECTED_STAGES=(memory-cache memory-vm)
+            SELECTED_STAGES=(memory-cache memory-stressapptest memory-memtester memory-vm)
             ;;
         all)
-            SELECTED_STAGES=(cpu-sustained cpu-transition cpu-core-cycle memory-cache memory-vm)
+            SELECTED_STAGES=(cpu-sustained cpu-transition cpu-core-cycle
+                memory-cache memory-stressapptest memory-memtester memory-vm)
             ;;
         benchmark)
             SELECTED_STAGES=(benchmark)
             ;;
-        cpu-sustained|cpu-transition|cpu-core-cycle|memory-cache|memory-vm)
+        cpu-sustained|cpu-transition|cpu-core-cycle|memory-cache|memory-stressapptest|memory-memtester|memory-vm)
             SELECTED_STAGES=("$MODE")
             ;;
         *)
@@ -321,8 +351,9 @@ build_stage_command() {
     local stage=$1
     local cpu=${2:-}
     local workers=${#CPUS[@]}
-    local vm_mib
+    local memory_mib
     local duration
+    local seconds
 
     case $stage in
         benchmark-single-warmup)
@@ -360,10 +391,24 @@ build_stage_command() {
             STAGE_COMMAND=(stress-ng --cache 0 --cache-level 3)
             duration=$CACHE_DURATION
             ;;
+        memory-stressapptest)
+            (( workers > 0 )) || die 'memory-stressapptest requires at least one selected CPU'
+            memory_mib=$(memory_target_mib "$workers")
+            seconds=$(duration_seconds "$STRESSAPPTEST_DURATION")
+            STAGE_COMMAND=(stressapptest -s "$seconds" -M "$memory_mib"
+                -m "$workers" -W --max_errors 1)
+            return
+            ;;
+        memory-memtester)
+            (( workers > 0 )) || die 'memory-memtester requires at least one selected CPU'
+            memory_mib=$(memory_target_mib "$workers")
+            STAGE_COMMAND=(memtester "${memory_mib}M" "$MEMTESTER_LOOPS")
+            return
+            ;;
         memory-vm)
             (( workers > 0 )) || die 'memory-vm requires at least one selected CPU'
-            vm_mib=$(vm_bytes_total_mib "$workers")
-            STAGE_COMMAND=(stress-ng --vm "$workers" --vm-bytes "${vm_mib}M"
+            memory_mib=$(memory_target_mib "$workers")
+            STAGE_COMMAND=(stress-ng --vm "$workers" --vm-bytes "${memory_mib}M"
                 --vm-method all)
             duration=$VM_DURATION
             ;;
@@ -385,7 +430,7 @@ print_command() {
 print_plan() {
     local stage
     local cpu
-    local vm_mib
+    local memory_mib
     local run
     local benchmark_cpu
 
@@ -416,10 +461,11 @@ print_plan() {
                 print_command
             done
         else
-            if [[ $stage == memory-vm ]]; then
-                vm_mib=$(vm_bytes_total_mib "${#CPUS[@]}")
+            if [[ $stage == memory-vm || $stage == memory-stressapptest ||
+                $stage == memory-memtester ]]; then
+                memory_mib=$(memory_target_mib "${#CPUS[@]}")
                 printf 'MEMORY target=%s%% workers=%s total=%sM\n' \
-                    "$MEMORY_PERCENT" "${#CPUS[@]}" "$vm_mib"
+                    "$MEMORY_PERCENT" "${#CPUS[@]}" "$memory_mib"
             fi
             printf 'STAGE %s\n' "$stage"
             build_stage_command "$stage"
@@ -449,6 +495,16 @@ parse_options() {
             --cache-duration)
                 (($# >= 2)) || die '--cache-duration requires a value'
                 CACHE_DURATION=$2
+                shift 2
+                ;;
+            --stressapptest-duration)
+                (($# >= 2)) || die '--stressapptest-duration requires a value'
+                STRESSAPPTEST_DURATION=$2
+                shift 2
+                ;;
+            --memtester-loops)
+                (($# >= 2)) || die '--memtester-loops requires a value'
+                MEMTESTER_LOOPS=$2
                 shift 2
                 ;;
             --vm-duration)
@@ -520,10 +576,12 @@ parse_options() {
     validate_duration "$CPU_DURATION"
     validate_duration "$CORE_DURATION"
     validate_duration "$CACHE_DURATION"
+    validate_duration "$STRESSAPPTEST_DURATION"
     validate_duration "$VM_DURATION"
     validate_duration "$BENCHMARK_DURATION"
     validate_duration "$BENCHMARK_WARMUP"
     validate_integer_range "$BENCHMARK_RUNS" 1 20 'benchmark runs'
+    validate_integer_range "$MEMTESTER_LOOPS" 1 100 'memtester loops'
     validate_integer_range "$MEMORY_PERCENT" 1 90 'memory percent'
     validate_integer_range "$TEMPERATURE_THRESHOLD" 40 110 'temperature threshold'
     [[ $REFRESH_RATE =~ ^[1-9][0-9]*([.][0-9]+)?$ ]] ||
@@ -687,11 +745,27 @@ stress_log_has_verification_error() {
 }
 
 stage_verdict_for_exit() {
-    case $1 in
-        0) printf 'PASS\n' ;;
-        2|5) printf 'FAIL\n' ;;
-        *) printf 'ERROR\n' ;;
-    esac
+    local exit_status=$1
+    local label=${2:-}
+    local log=${3:-}
+
+    if (( exit_status == 0 )); then
+        printf 'PASS\n'
+    elif [[ $label == memory-stressapptest ]] && (( exit_status == 1 )); then
+        if [[ -r $log ]] && grep -Fq 'Status: FAIL - test discovered HW problems' "$log"; then
+            printf 'FAIL\n'
+        else
+            printf 'ERROR\n'
+        fi
+    elif [[ $label == memory-memtester ]] &&
+        (( exit_status <= 7 && (exit_status & 6) != 0 )); then
+        printf 'FAIL\n'
+    elif [[ $label != memory-stressapptest && $label != memory-memtester ]] &&
+        (( exit_status == 2 || exit_status == 5 )); then
+        printf 'FAIL\n'
+    else
+        printf 'ERROR\n'
+    fi
 }
 
 stage_manifest_complete() {
@@ -713,7 +787,7 @@ stage_manifest_complete() {
         [[ -n $label && $exit_status =~ ^[0-9]+$ && $verdict =~ ^(PASS|FAIL|ERROR)$ ]] ||
             return 1
         ((${#exit_status} <= 3 && 10#$exit_status <= 255)) || return 1
-        [[ $verdict == "$(stage_verdict_for_exit "$exit_status")" ]] || return 1
+        [[ $verdict == "$(stage_verdict_for_exit "$exit_status" "$label" "$dir/$label.log")" ]] || return 1
         [[ -z $extra && ${expected[$label]+set} && ! ${actual[$label]+set} ]] || return 1
         actual[$label]=1
     done < "$dir/stages.tsv"
@@ -945,47 +1019,12 @@ start_file_telemetry() {
     if command_exists sensors; then
         sensors > "$RUN_DIR/telemetry/sensors-before.txt" 2>&1 || true
     fi
-
-    if command_exists turbostat; then
-        TURBOSTAT_OUTER_PGID_FILE="$RUN_DIR/telemetry/.turbostat-outer.pid"
-        TURBOSTAT_INNER_PGID_FILE="$RUN_DIR/telemetry/.turbostat-inner.pid"
-        : > "$TURBOSTAT_OUTER_PGID_FILE"
-        : > "$TURBOSTAT_INNER_PGID_FILE"
-        setsid "$SCRIPT_PATH" __privileged_supervisor \
-            "$TURBOSTAT_OUTER_PGID_FILE" "$TURBOSTAT_INNER_PGID_FILE" \
-            turbostat --quiet --Summary --interval "$REFRESH_RATE" \
-            --out "$RUN_DIR/telemetry/turbostat.txt" \
-            > "$RUN_DIR/telemetry/turbostat-errors.txt" 2>&1 &
-        TURBOSTAT_PID=$!
-    else
-        printf 'turbostat is not installed\n' > "$RUN_DIR/telemetry/turbostat-unavailable.txt"
-    fi
 }
 
 stop_file_telemetry() {
-    if [[ $TURBOSTAT_PID =~ ^[1-9][0-9]*$ ]]; then
-        terminate_supervised_command "$TURBOSTAT_PID" \
-            "$TURBOSTAT_OUTER_PGID_FILE" "$TURBOSTAT_INNER_PGID_FILE"
-    fi
-    TURBOSTAT_PID=""
-    rm -f -- "$TURBOSTAT_OUTER_PGID_FILE" "$TURBOSTAT_INNER_PGID_FILE"
-    TURBOSTAT_OUTER_PGID_FILE=""
-    TURBOSTAT_INNER_PGID_FILE=""
     if command_exists sensors; then
         sensors > "$RUN_DIR/telemetry/sensors-after.txt" 2>&1 || true
     fi
-}
-
-read_process_record() {
-    local file=$1
-    local pid
-    local starttime
-    local extra
-
-    [[ -s $file ]] || return 1
-    read -r pid starttime extra < "$file" || return 1
-    [[ $pid =~ ^[1-9][0-9]*$ && $starttime =~ ^[0-9]+$ && -z $extra ]] || return 1
-    printf '%s %s\n' "$pid" "$starttime"
 }
 
 process_is_running() {
@@ -994,12 +1033,14 @@ process_is_running() {
     local stat_tail
     local state
 
-    kill -0 "$pid" 2>/dev/null || return 1
-    [[ -r $PROC_ROOT/$pid/stat ]] || return 0
-    stat=$(< "$PROC_ROOT/$pid/stat")
-    stat_tail=${stat##*) }
-    state=${stat_tail%% *}
-    [[ $state != Z ]]
+    if [[ -r $PROC_ROOT/$pid/stat ]]; then
+        stat=$(< "$PROC_ROOT/$pid/stat")
+        stat_tail=${stat##*) }
+        state=${stat_tail%% *}
+        [[ $state != Z ]]
+        return
+    fi
+    kill -0 "$pid" 2>/dev/null
 }
 
 process_starttime() {
@@ -1020,130 +1061,626 @@ process_starttime() {
 process_matches_identity() {
     local pid=$1
     local expected_starttime=$2
-    local actual_starttime
+    local stat
+    local stat_tail
+    local fields=()
 
-    actual_starttime=$(process_starttime "$pid") || return 1
-    process_is_running "$pid" && [[ $actual_starttime == "$expected_starttime" ]]
+    [[ -r $PROC_ROOT/$pid/stat ]] || return 1
+    stat=$(< "$PROC_ROOT/$pid/stat")
+    stat_tail=${stat##*) }
+    read -r -a fields <<< "$stat_tail"
+    ((${#fields[@]} >= 20)) || return 1
+    [[ ${fields[0]} != Z && ${fields[19]} == "$expected_starttime" ]]
 }
 
-write_process_record() {
-    local file=$1
-    local pid=$2
-    local starttime
-
-    starttime=$(process_starttime "$pid") || return 1
-    printf '%s %s\n' "$pid" "$starttime" > "$file"
-}
-
-signal_recorded_group() {
-    local signal=$1
-    local record_file=$2
-    local privileged=$3
-    local record
-    local pid
-    local expected_starttime
-    local actual_starttime
-
-    record=$(read_process_record "$record_file" 2>/dev/null || true)
-    [[ -n $record ]] || return 0
-    read -r pid expected_starttime <<< "$record"
-    actual_starttime=$(process_starttime "$pid" 2>/dev/null || true)
-    [[ -n $actual_starttime && $actual_starttime == "$expected_starttime" ]] || return 0
-    if (( privileged == 1 )); then
-        sudo -- kill "-$signal" -- "-$pid" 2>/dev/null || true
+authenticate_sudo() {
+    if [[ -n ${SUDO_ASKPASS:-} && -x ${SUDO_ASKPASS:-} ]]; then
+        printf 'Requesting administrator authentication with SUDO_ASKPASS.\n'
+        sudo -A -v || {
+            printf 'Graphical authentication failed; falling back to the terminal.\n'
+            sudo -v || return 1
+        }
     else
-        kill "-$signal" -- "-$pid" 2>/dev/null || true
+        printf 'Administrator authentication is required once for this run.\n'
+        sudo -v || return 1
     fi
 }
 
-terminate_supervised_command() {
-    local wrapper_pid=$1
-    local outer_pgid_file=$2
-    local inner_pgid_file=$3
+close_broker_fds() {
+    if [[ $BROKER_IN_FD =~ ^[0-9]+$ ]]; then
+        exec {BROKER_IN_FD}>&-
+    fi
+    if [[ $BROKER_OUT_FD =~ ^[0-9]+$ ]]; then
+        exec {BROKER_OUT_FD}<&-
+    fi
+    BROKER_IN_FD=""
+    BROKER_OUT_FD=""
+    if [[ -n $BROKER_REQUEST_PATH ]]; then
+        rm -f -- "$BROKER_REQUEST_PATH"
+        BROKER_REQUEST_PATH=""
+    fi
+}
+
+broker_wrapper_is_running() {
+    [[ $BROKER_PID =~ ^[1-9][0-9]*$ && $BROKER_STARTTIME =~ ^[0-9]+$ ]] || return 1
+    process_matches_identity "$BROKER_PID" "$BROKER_STARTTIME"
+}
+
+start_privileged_broker() {
+    local response
+    local version
+    local coproc_input_fd
+    local broker_bash
+    local broker_bash_metadata
+    local broker_bash_owner
+    local broker_bash_mode
+    local worker_starttime
+
+    authenticate_sudo || return 1
+    broker_bash=$(readlink -f -- "${BASH:-/bin/bash}") || return 1
+    [[ -x $broker_bash && ! -L $broker_bash ]] || return 1
+    broker_bash_metadata=$(stat -c '%u %a' -- "$broker_bash") || return 1
+    read -r broker_bash_owner broker_bash_mode <<< "$broker_bash_metadata"
+    [[ $broker_bash_owner == 0 && $broker_bash_mode =~ ^[0-7]+$ ]] || return 1
+    (( (8#$broker_bash_mode & 0022) == 0 )) || return 1
+    worker_starttime=$(process_starttime "$$") || return 1
+    BROKER_REQUEST_PATH="$RUN_DIR/.broker-requests"
+    rm -f -- "$BROKER_REQUEST_PATH"
+    mkfifo -m 600 -- "$BROKER_REQUEST_PATH" || return 1
+    coproc STRESS_UV_BROKER_PROCESS {
+        sudo -n -- "$broker_bash" "$SCRIPT_PATH" __broker \
+            "$MODE" "$CPU_DURATION" "$CORE_DURATION" "$CACHE_DURATION" \
+            "$VM_DURATION" "$MEMORY_PERCENT" "$REFRESH_RATE" "$CPU_LIST" \
+            "$STARTED_AT" "$BENCHMARK_DURATION" "$BENCHMARK_WARMUP" \
+            "$BENCHMARK_RUNS" "$$" "$worker_starttime" \
+            "$(id -u)" "$BROKER_REQUEST_PATH" "$STRESSAPPTEST_DURATION" \
+            "$MEMTESTER_LOOPS"
+    } 2>> "$RUN_DIR/broker-errors.txt"
+    BROKER_PID=$STRESS_UV_BROKER_PROCESS_PID
+    BROKER_STARTTIME=$(process_starttime "$BROKER_PID" 2>/dev/null || true)
+    BROKER_OUT_FD=${STRESS_UV_BROKER_PROCESS[0]}
+    coproc_input_fd=${STRESS_UV_BROKER_PROCESS[1]}
+    exec {coproc_input_fd}>&-
+
+    if [[ ! $BROKER_STARTTIME =~ ^[0-9]+$ ]] ||
+        ! IFS=$'\t' read -r -t 15 -u "$BROKER_OUT_FD" response version ||
+        [[ $response != READY || $version != 1 ]]; then
+        printf 'stress-uv: privileged broker failed to start\n' >&2
+        close_broker_fds
+        broker_wrapper_is_running && kill -TERM "$BROKER_PID" 2>/dev/null || true
+        wait "$BROKER_PID" 2>/dev/null || true
+        BROKER_PID=""
+        BROKER_STARTTIME=""
+        return 1
+    fi
+    exec {BROKER_IN_FD}> "$BROKER_REQUEST_PATH" || return 1
+    if [[ -n $TUI_PANE ]]; then
+        tmux select-pane -t "$TUI_PANE" 2>/dev/null || true
+    fi
+}
+
+send_broker_request() {
+    [[ $BROKER_IN_FD =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$1" 2>/dev/null >&"$BROKER_IN_FD"
+}
+
+receive_stage_from_broker() {
+    local log=$1
+    local encoded="$log.b64"
+    local type
+    local field
+    local payload
+    local decoded=0
+    local read_status
+    local temporary="$log.partial.$$"
+
+    rm -f -- "$log" "$temporary"
+    : > "$encoded"
+    while :; do
+        if IFS=$'\t' read -r -t 1 -u "$BROKER_OUT_FD" type field payload 2>/dev/null; then
+            read_status=0
+        else
+            read_status=$?
+            (( read_status > 128 )) && continue
+            rm -f -- "$encoded" "$temporary" "$log"
+            return 125
+        fi
+        case $type in
+            DATA_BEGIN)
+                [[ $field == stage ]] || { rm -f -- "$encoded" "$temporary" "$log"; return 125; }
+                : > "$encoded"
+                ;;
+            DATA)
+                [[ $field == stage && -n ${payload:-} ]] || { rm -f -- "$encoded" "$temporary" "$log"; return 125; }
+                printf '%s\n' "$payload" >> "$encoded"
+                ;;
+            DATA_END)
+                [[ $field == stage ]] || { rm -f -- "$encoded" "$temporary" "$log"; return 125; }
+                if ! base64 -d -- "$encoded" > "$temporary"; then
+                    rm -f -- "$encoded" "$temporary" "$log"
+                    return 125
+                fi
+                decoded=1
+                ;;
+            DONE)
+                [[ $field =~ ^[0-9]+$ && $decoded == 1 ]] || { rm -f -- "$encoded" "$temporary" "$log"; return 125; }
+                mv -f -- "$temporary" "$log" || { rm -f -- "$encoded" "$temporary" "$log"; return 125; }
+                rm -f -- "$encoded"
+                return "$field"
+                ;;
+            ERROR)
+                printf 'stress-uv: privileged broker: %s\n' "$field" >&2
+                rm -f -- "$encoded" "$temporary" "$log"
+                return 125
+                ;;
+            *)
+                rm -f -- "$encoded" "$temporary" "$log"
+                return 125
+                ;;
+        esac
+    done
+}
+
+telemetry_path_for_source() {
+    case $1 in
+        turbostat) printf '%s\n' "$RUN_DIR/telemetry/turbostat.txt" ;;
+        turbostat-errors) printf '%s\n' "$RUN_DIR/telemetry/turbostat-errors.txt" ;;
+        turbostat-unavailable) printf '%s\n' "$RUN_DIR/telemetry/turbostat-unavailable.txt" ;;
+        kernel) printf '%s\n' "$RUN_DIR/kernel.log" ;;
+        kernel-errors) printf '%s\n' "$RUN_DIR/kernel-errors.txt" ;;
+        journal-unavailable) printf '%s\n' "$RUN_DIR/kernel-errors.txt" ;;
+        *) return 1 ;;
+    esac
+}
+
+collect_broker_telemetry() {
+    local type
+    local source
+    local payload
+    local read_status
+    local target=""
+    local encoded=""
+    local temporary=""
+    local index
+    local -a pending_targets=()
+    local -a pending_temporaries=()
+    local -A seen_sources=()
+
+    send_broker_request COLLECT || return 1
+    while :; do
+        if IFS=$'\t' read -r -t 2 -u "$BROKER_OUT_FD" type source payload 2>/dev/null; then
+            read_status=0
+        else
+            read_status=$?
+            (( read_status > 128 )) && continue
+            rm -f -- "${pending_temporaries[@]}" "$temporary" "$encoded"
+            return 1
+        fi
+        case $type in
+            DATA_BEGIN)
+                target=$(telemetry_path_for_source "$source") || return 1
+                [[ -z ${seen_sources[$source]:-} ]] || return 1
+                seen_sources[$source]=1
+                encoded="$target.b64"
+                temporary="$target.partial.$$"
+                rm -f -- "$target" "$temporary"
+                : > "$encoded"
+                ;;
+            DATA)
+                [[ -n $encoded && -n ${payload:-} ]] || return 1
+                printf '%s\n' "$payload" >> "$encoded"
+                ;;
+            DATA_END)
+                [[ -n $encoded && $target == "$(telemetry_path_for_source "$source")" ]] || return 1
+                if ! base64 -d -- "$encoded" > "$temporary"; then
+                    rm -f -- "${pending_temporaries[@]}" "$temporary" "$encoded"
+                    return 1
+                fi
+                pending_targets+=("$target")
+                pending_temporaries+=("$temporary")
+                rm -f -- "$encoded"
+                target=""
+                encoded=""
+                temporary=""
+                ;;
+            COLLECTED)
+                [[ $source == 0 && -z $encoded ]] || return 1
+                for ((index = 0; index < ${#pending_targets[@]}; index++)); do
+                    mv -f -- "${pending_temporaries[index]}" "${pending_targets[index]}" || return 1
+                done
+                return 0
+                ;;
+            ERROR)
+                printf 'stress-uv: privileged broker: %s\n' "$source" >&2
+                return 1
+                ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
+stop_privileged_broker() {
+    local acknowledged=0
     local attempt
+    local stopped=0
+    local type
+    local value
 
-    signal_recorded_group TERM "$inner_pgid_file" 1
-    signal_recorded_group TERM "$outer_pgid_file" 1
-    kill -TERM "$wrapper_pid" 2>/dev/null || true
-
-    for ((attempt = 0; attempt < 10; attempt++)); do
-        process_is_running "$wrapper_pid" || break
+    if [[ $BROKER_IN_FD =~ ^[0-9]+$ ]]; then
+        if send_broker_request SHUTDOWN &&
+            IFS=$'\t' read -r -t 5 -u "$BROKER_OUT_FD" type value 2>/dev/null &&
+            [[ $type == BYE && $value == 0 ]]; then
+            acknowledged=1
+        else
+            send_broker_request CANCEL || true
+        fi
+    fi
+    close_broker_fds
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        broker_wrapper_is_running || break
         sleep 0.1
     done
-    signal_recorded_group KILL "$inner_pgid_file" 1
-    signal_recorded_group KILL "$outer_pgid_file" 1
-    kill -KILL "$wrapper_pid" 2>/dev/null || true
-    wait "$wrapper_pid" 2>/dev/null || true
+    if broker_wrapper_is_running; then
+        kill -TERM "$BROKER_PID" 2>/dev/null || true
+        for ((attempt = 0; attempt < 20; attempt++)); do
+            broker_wrapper_is_running || break
+            sleep 0.1
+        done
+    fi
+    if broker_wrapper_is_running; then
+        kill -KILL "$BROKER_PID" 2>/dev/null || true
+        for ((attempt = 0; attempt < 20; attempt++)); do
+            broker_wrapper_is_running || break
+            sleep 0.1
+        done
+    fi
+    if [[ $BROKER_PID =~ ^[1-9][0-9]*$ ]] && ! broker_wrapper_is_running; then
+        stopped=1
+        wait "$BROKER_PID" 2>/dev/null || true
+    fi
+    BROKER_PID=""
+    BROKER_STARTTIME=""
+    (( acknowledged == 1 && stopped == 1 ))
 }
 
-terminate_active_stage() {
-    if [[ $ACTIVE_STAGE_WRAPPER_PID =~ ^[1-9][0-9]*$ ]]; then
-        terminate_supervised_command "$ACTIVE_STAGE_WRAPPER_PID" \
-            "$ACTIVE_STAGE_OUTER_PGID_FILE" "$ACTIVE_STAGE_INNER_PGID_FILE"
-    fi
+cancel_privileged_broker() {
+    local attempt
 
-    rm -f -- "$ACTIVE_STAGE_OUTER_PGID_FILE" "$ACTIVE_STAGE_INNER_PGID_FILE"
-    ACTIVE_STAGE_WRAPPER_PID=""
-    ACTIVE_STAGE_OUTER_PGID_FILE=""
-    ACTIVE_STAGE_INNER_PGID_FILE=""
+    trap '' PIPE
+    if [[ $BROKER_IN_FD =~ ^[0-9]+$ ]]; then
+        if send_broker_request CANCEL; then
+            printf 'cancellation sent to privileged broker\n' >> "$RUN_DIR/events.log"
+        else
+            printf 'privileged broker cancellation pipe unavailable\n' >> "$RUN_DIR/events.log"
+        fi
+    fi
+    for ((attempt = 0; attempt < 10; attempt++)); do
+        broker_wrapper_is_running || break
+        sleep 0.1
+    done
+    close_broker_fds
+    if broker_wrapper_is_running; then
+        kill -TERM "$BROKER_PID" 2>/dev/null || true
+    fi
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        broker_wrapper_is_running || break
+        sleep 0.1
+    done
+    if broker_wrapper_is_running; then
+        kill -KILL "$BROKER_PID" 2>/dev/null || true
+        for ((attempt = 0; attempt < 20; attempt++)); do
+            broker_wrapper_is_running || break
+            sleep 0.1
+        done
+    fi
+    if [[ $BROKER_PID =~ ^[1-9][0-9]*$ ]] && ! broker_wrapper_is_running; then
+        wait "$BROKER_PID" 2>/dev/null || true
+    fi
+    BROKER_PID=""
+    BROKER_STARTTIME=""
 }
 
-supervisor_signal() {
-    trap '' INT TERM HUP
-    if [[ $SUPERVISED_CHILD_PID =~ ^[1-9][0-9]*$ ]]; then
-        kill -TERM "$SUPERVISED_CHILD_PID" 2>/dev/null || true
+broker_send_file() {
+    local source=$1
+    local file=$2
+    local chunk
+    local encoded="$BROKER_TMP_DIR/transfer-${source}.b64"
+
+    if ! base64 -- "$file" > "$encoded"; then
+        rm -f -- "$encoded"
+        return 1
     fi
-    while :; do
-        sleep 1
+    printf 'DATA_BEGIN\t%s\n' "$source"
+    if [[ -s $encoded ]]; then
+        while IFS= read -r chunk; do
+            printf 'DATA\t%s\t%s\n' "$source" "$chunk"
+        done < "$encoded"
+    fi
+    printf 'DATA_END\t%s\n' "$source"
+    rm -f -- "$encoded"
+}
+
+broker_stop_process_group() {
+    local pid=$1
+    local attempt
+
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || return 0
+    kill -TERM -- "-$pid" 2>/dev/null || true
+    for ((attempt = 0; attempt < 10; attempt++)); do
+        process_is_running "$pid" || break
+        sleep 0.1
+    done
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
+broker_stop_process_groups() {
+    local pid
+    local attempt
+    local running
+
+    for pid in "$@"; do
+        [[ $pid =~ ^[1-9][0-9]*$ ]] || continue
+        kill -TERM -- "-$pid" 2>/dev/null || true
+    done
+    for ((attempt = 0; attempt < 20; attempt++)); do
+        running=0
+        for pid in "$@"; do
+            [[ $pid =~ ^[1-9][0-9]*$ ]] || continue
+            process_is_running "$pid" && running=1
+        done
+        (( running == 0 )) && break
+        sleep 0.1
+    done
+    for pid in "$@"; do
+        [[ $pid =~ ^[1-9][0-9]*$ ]] || continue
+        kill -KILL -- "-$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
     done
 }
 
-root_supervisor_main() {
-    local inner_pgid_file=$1
+broker_cleanup() {
+    (( ${BROKER_CLEANING_UP:-0} == 0 )) || return
+    BROKER_CLEANING_UP=1
+    trap - EXIT
+    trap '' INT TERM HUP PIPE
+    broker_stop_process_groups "${BROKER_CHILD_PID:-}" \
+        "${BROKER_TURBOSTAT_PID:-}" "${BROKER_JOURNAL_PID:-}"
+    [[ -n ${BROKER_TMP_DIR:-} ]] && rm -rf -- "$BROKER_TMP_DIR"
+}
+
+broker_signal() {
+    broker_cleanup
+    exit 130
+}
+
+broker_start_telemetry() {
+    : > "$BROKER_TMP_DIR/turbostat.txt"
+    : > "$BROKER_TMP_DIR/turbostat-errors.txt"
+    : > "$BROKER_TMP_DIR/kernel.log"
+    : > "$BROKER_TMP_DIR/kernel-errors.txt"
+    if command_exists turbostat; then
+        setsid turbostat --quiet --Summary --interval "$REFRESH_RATE" \
+            --out "$BROKER_TMP_DIR/turbostat.txt" \
+            > "$BROKER_TMP_DIR/turbostat-errors.txt" 2>&1 &
+        BROKER_TURBOSTAT_PID=$!
+    else
+        printf 'turbostat is not installed\n' > "$BROKER_TMP_DIR/turbostat-unavailable.txt"
+    fi
+    if command_exists journalctl; then
+        journalctl -k --since "$STARTED_AT" --no-pager -o short-iso \
+            > "$BROKER_TMP_DIR/kernel.log" 2> "$BROKER_TMP_DIR/kernel-errors.txt" || true
+        setsid journalctl -kf -o short-iso \
+            >> "$BROKER_TMP_DIR/kernel.log" 2>> "$BROKER_TMP_DIR/kernel-errors.txt" &
+        BROKER_JOURNAL_PID=$!
+    else
+        printf 'journalctl is not installed\n' > "$BROKER_TMP_DIR/journal-unavailable.txt"
+    fi
+}
+
+broker_stop_telemetry() {
+    broker_stop_process_group "${BROKER_TURBOSTAT_PID:-}"
+    broker_stop_process_group "${BROKER_JOURNAL_PID:-}"
+    BROKER_TURBOSTAT_PID=""
+    BROKER_JOURNAL_PID=""
+}
+
+broker_stage_allowed() {
+    local requested=$1
+    local cpu=$2
+    local allowed_cpu
+    local selected
+    local run
+
+    for selected in "${SELECTED_STAGES[@]}"; do
+        if [[ $selected == "$requested" && -z $cpu ]]; then
+            return 0
+        fi
+        if [[ $selected == cpu-core-cycle && $requested == cpu-core-cycle && $cpu =~ ^[0-9]+$ ]]; then
+            for allowed_cpu in "${CPUS[@]}"; do
+                [[ $allowed_cpu == "$cpu" ]] && return 0
+            done
+        fi
+        if [[ $selected == benchmark ]]; then
+            case $requested in
+                benchmark-single-warmup|benchmark-multi-warmup) [[ -z $cpu ]] && return 0 ;;
+                benchmark-single-run-*|benchmark-multi-run-*)
+                    run=${requested##*-}
+                    [[ -z $cpu && $run =~ ^[1-9][0-9]*$ && $run -le $BENCHMARK_RUNS ]] && return 0
+                    ;;
+            esac
+        fi
+    done
+    return 1
+}
+
+broker_run_stage() {
+    local stage=$1
+    local cpu=$2
+    local command
+    local extra
     local exit_status
+    local log="$BROKER_TMP_DIR/stage.log"
 
-    shift
-    (($# > 0)) || die 'privileged supervisor received no command'
-    write_process_record "$inner_pgid_file" "$$" || die 'cannot record privileged supervisor identity'
-    "$@" &
-    SUPERVISED_CHILD_PID=$!
-
-    trap supervisor_signal INT TERM HUP
-    if wait "$SUPERVISED_CHILD_PID"; then
+    broker_stage_allowed "$stage" "$cpu" || {
+        printf 'ERROR\tinvalid stage request\n'
+        return 125
+    }
+    build_stage_command "$stage" "$cpu"
+    : > "$log"
+    STRESS_UV_STAGE_LABEL=$stage setsid "${STAGE_COMMAND[@]}" > "$log" 2>&1 &
+    BROKER_CHILD_PID=$!
+    while process_is_running "$BROKER_CHILD_PID"; do
+        if ! process_matches_identity "$BROKER_WORKER_PID" "$BROKER_WORKER_STARTTIME"; then
+            broker_stop_process_group "$BROKER_CHILD_PID"
+            BROKER_CHILD_PID=""
+            return 130
+        fi
+        if IFS=$'\t' read -r -t 0.2 -u "$BROKER_REQUEST_FD" command extra; then
+            if [[ $command == CANCEL && -z ${extra:-} ]]; then
+                printf 'stress-uv broker: cancellation received\n' >&2
+                broker_stop_process_group "$BROKER_CHILD_PID"
+                BROKER_CHILD_PID=""
+                return 130
+            fi
+            printf 'ERROR\tunexpected request while stage is running\n'
+            broker_stop_process_group "$BROKER_CHILD_PID"
+            BROKER_CHILD_PID=""
+            return 125
+        fi
+    done
+    if wait "$BROKER_CHILD_PID"; then
         exit_status=0
     else
         exit_status=$?
     fi
-    trap - INT TERM HUP
-    return "$exit_status"
+    BROKER_CHILD_PID=""
+    if ! broker_send_file stage "$log"; then
+        printf 'ERROR\tstage evidence encoding failed\n'
+        return 125
+    fi
+    printf 'DONE\t%s\n' "$exit_status"
 }
 
-privileged_supervisor_main() {
-    local outer_pgid_file=$1
-    local inner_pgid_file=$2
-    local exit_status
-
-    shift 2
-    (($# > 0)) || die 'outer supervisor received no command'
-    write_process_record "$outer_pgid_file" "$$" || die 'cannot record outer supervisor identity'
-    sudo -- setsid "$SCRIPT_PATH" __root_supervisor "$inner_pgid_file" "$@" &
-    SUPERVISED_CHILD_PID=$!
-
-    trap supervisor_signal INT TERM HUP
-    if wait "$SUPERVISED_CHILD_PID"; then
-        exit_status=0
+broker_collect_telemetry() {
+    broker_stop_telemetry
+    if [[ -e $BROKER_TMP_DIR/turbostat-unavailable.txt ]]; then
+        broker_send_file turbostat-unavailable "$BROKER_TMP_DIR/turbostat-unavailable.txt" || return 125
     else
-        exit_status=$?
+        broker_send_file turbostat "$BROKER_TMP_DIR/turbostat.txt" || return 125
+        broker_send_file turbostat-errors "$BROKER_TMP_DIR/turbostat-errors.txt" || return 125
     fi
-    trap - INT TERM HUP
-    return "$exit_status"
+    if [[ -e $BROKER_TMP_DIR/journal-unavailable.txt ]]; then
+        broker_send_file journal-unavailable "$BROKER_TMP_DIR/journal-unavailable.txt" || return 125
+    else
+        broker_send_file kernel "$BROKER_TMP_DIR/kernel.log" || return 125
+        broker_send_file kernel-errors "$BROKER_TMP_DIR/kernel-errors.txt" || return 125
+    fi
+    printf 'COLLECTED\t0\n'
 }
 
-collect_kernel_log() {
-    if ! sudo journalctl -k --since "$STARTED_AT" --no-pager -o short-iso \
-        > "$RUN_DIR/kernel.log" 2> "$RUN_DIR/kernel-errors.txt"; then
-        : > "$RUN_DIR/kernel.log"
+broker_main() {
+    (($# == 18)) || die 'internal broker received invalid arguments'
+    MODE=$1
+    CPU_DURATION=$2
+    CORE_DURATION=$3
+    CACHE_DURATION=$4
+    VM_DURATION=$5
+    MEMORY_PERCENT=$6
+    REFRESH_RATE=$7
+    CPU_LIST=$8
+    STARTED_AT=$9
+    BENCHMARK_DURATION=${10}
+    BENCHMARK_WARMUP=${11}
+    BENCHMARK_RUNS=${12}
+    BROKER_WORKER_PID=${13}
+    BROKER_WORKER_STARTTIME=${14}
+    local worker_uid=${15}
+    local request_path=${16}
+    STRESSAPPTEST_DURATION=${17}
+    MEMTESTER_LOOPS=${18}
+    local command
+    local stage
+    local cpu
+    local extra
+    local read_status
+
+    validate_duration "$CPU_DURATION"
+    validate_duration "$CORE_DURATION"
+    validate_duration "$CACHE_DURATION"
+    validate_duration "$STRESSAPPTEST_DURATION"
+    validate_duration "$VM_DURATION"
+    validate_duration "$BENCHMARK_DURATION"
+    validate_duration "$BENCHMARK_WARMUP"
+    validate_integer_range "$BENCHMARK_RUNS" 1 20 'benchmark runs'
+    validate_integer_range "$MEMTESTER_LOOPS" 1 100 'memtester loops'
+    validate_integer_range "$MEMORY_PERCENT" 1 95 'memory percent'
+    [[ $REFRESH_RATE =~ ^[1-9][0-9]*([.][0-9]+)?$ ]] || die 'invalid broker refresh rate'
+    [[ $BROKER_WORKER_PID =~ ^[1-9][0-9]*$ && $BROKER_WORKER_STARTTIME =~ ^[0-9]+$ ]] ||
+        die 'invalid broker worker identity'
+    [[ $worker_uid =~ ^[0-9]+$ ]] || die 'invalid broker worker owner'
+    [[ -p $request_path && ! -L $request_path ]] || die 'invalid broker request pipe'
+    [[ $(stat -c '%u:%a' -- "$request_path") == "$worker_uid:600" ]] ||
+        die 'insecure broker request pipe'
+    exec {BROKER_REQUEST_FD}<> "$request_path" || die 'cannot open broker request pipe'
+    expand_cpu_list "$CPU_LIST"
+    select_stages
+    if (( EUID == 0 )); then
+        local broker_tmp_parent=/run/stress-uv
+        [[ ! -e $broker_tmp_parent || ( -d $broker_tmp_parent && ! -L $broker_tmp_parent ) ]] ||
+            die 'invalid broker workspace parent'
+        mkdir -p -- "$broker_tmp_parent" || die 'cannot create broker workspace parent'
+        chown 0:0 -- "$broker_tmp_parent" || die 'cannot own broker workspace parent'
+        chmod 700 -- "$broker_tmp_parent" || die 'cannot protect broker workspace parent'
+        [[ $(stat -c '%u:%a' -- "$broker_tmp_parent") == 0:700 ]] ||
+            die 'insecure broker workspace parent'
+    else
+        local broker_tmp_parent=${STRESS_UV_TEST_BROKER_TMP_PARENT:-${TMPDIR:-/tmp}/stress-uv-test-broker}
+        mkdir -p -- "$broker_tmp_parent" || die 'cannot create test broker workspace parent'
     fi
+    BROKER_TMP_DIR=$(mktemp -d -p "$broker_tmp_parent" stress-uv-broker.XXXXXXXX) ||
+        die 'cannot create broker workspace'
+    BROKER_CHILD_PID=""
+    BROKER_TURBOSTAT_PID=""
+    BROKER_JOURNAL_PID=""
+    BROKER_CLEANING_UP=0
+    trap broker_cleanup EXIT
+    trap broker_signal INT TERM HUP PIPE
+    broker_start_telemetry
+    printf 'READY\t1\n'
+
+    while :; do
+        process_matches_identity "$BROKER_WORKER_PID" "$BROKER_WORKER_STARTTIME" || return 130
+        command=""
+        stage=""
+        cpu=""
+        extra=""
+        if IFS=$'\t' read -r -t 0.2 -u "$BROKER_REQUEST_FD" command stage cpu extra; then
+            read_status=0
+        else
+            read_status=$?
+            (( read_status > 128 )) && continue
+            return 125
+        fi
+        [[ -z ${extra:-} ]] || {
+            printf 'ERROR\tinvalid request fields\n'
+            continue
+        }
+        case $command in
+            RUN) broker_run_stage "${stage:-}" "${cpu:-}" || return $? ;;
+            COLLECT)
+                [[ -z ${stage:-}${cpu:-} ]] || { printf 'ERROR\tinvalid collect request\n'; continue; }
+                broker_collect_telemetry || { printf 'ERROR\ttelemetry evidence encoding failed\n'; return 125; }
+                ;;
+            SHUTDOWN)
+                [[ -z ${stage:-}${cpu:-} ]] || { printf 'ERROR\tinvalid shutdown request\n'; continue; }
+                printf 'BYE\t0\n'
+                return 0
+                ;;
+            CANCEL) return 130 ;;
+            *) printf 'ERROR\tunknown request\n' ;;
+        esac
+    done
 }
 
 run_stress_stage() {
@@ -1153,56 +1690,33 @@ run_stress_stage() {
     local log
     local exit_status
     local verdict
-    local outer_pgid_file="$RUN_DIR/.active-stage-outer.pid"
-    local inner_pgid_file="$RUN_DIR/.active-stage-inner.pid"
-    local attempt
 
     [[ -n $cpu ]] && label="${stage}-cpu-${cpu}"
     log="$RUN_DIR/${label}.log"
     build_stage_command "$stage" "$cpu"
     CURRENT_STAGE=$label
     write_state RUNNING "$label"
-    printf '\n[%s] START %s\n' "$(date --iso-8601=seconds)" "$label"
+    printf '\n[%s] START %s\n' "$(date --iso-8601=seconds)" "$label" | tee -a "$RUN_DIR/events.log"
     printf 'Command:'
-    printf ' %q' sudo "${STAGE_COMMAND[@]}" --log-file "$log"
+    printf ' %q' sudo "${STAGE_COMMAND[@]}"
     printf '\n'
 
-    : > "$outer_pgid_file"
-    : > "$inner_pgid_file"
-    setsid "$SCRIPT_PATH" __privileged_supervisor \
-        "$outer_pgid_file" "$inner_pgid_file" \
-        "${STAGE_COMMAND[@]}" --log-file "$log" &
-    ACTIVE_STAGE_WRAPPER_PID=$!
-    ACTIVE_STAGE_OUTER_PGID_FILE=$outer_pgid_file
-    ACTIVE_STAGE_INNER_PGID_FILE=$inner_pgid_file
-    for ((attempt = 0; attempt < 100; attempt++)); do
-        [[ -s $inner_pgid_file ]] && break
-        process_is_running "$ACTIVE_STAGE_WRAPPER_PID" || break
-        sleep 0.01
-    done
-
-    if ! read_process_record "$inner_pgid_file" >/dev/null; then
-        terminate_active_stage
+    if ! send_broker_request "RUN"$'\t'"$stage"$'\t'"$cpu"; then
         exit_status=125
-    elif wait "$ACTIVE_STAGE_WRAPPER_PID"; then
-        exit_status=0
     else
+        receive_stage_from_broker "$log"
         exit_status=$?
     fi
-    ACTIVE_STAGE_WRAPPER_PID=""
-    ACTIVE_STAGE_OUTER_PGID_FILE=""
-    ACTIVE_STAGE_INNER_PGID_FILE=""
-    rm -f -- "$outer_pgid_file" "$inner_pgid_file"
 
     if (( exit_status == 0 )) && [[ $label == benchmark-*-run-* ]] &&
         ! extract_benchmark_metrics "$log" "$label"; then
         printf 'stress-uv: missing or invalid Mfp-ops/sec metrics\n' >> "$log"
         exit_status=125
     fi
-    verdict=$(stage_verdict_for_exit "$exit_status")
+    verdict=$(stage_verdict_for_exit "$exit_status" "$label" "$log")
     printf '%s\t%s\t%s\n' "$label" "$exit_status" "$verdict" >> "$RUN_DIR/stages.tsv"
     printf '[%s] END %s exit=%s verdict=%s\n' \
-        "$(date --iso-8601=seconds)" "$label" "$exit_status" "$verdict"
+        "$(date --iso-8601=seconds)" "$label" "$exit_status" "$verdict" | tee -a "$RUN_DIR/events.log"
     return "$exit_status"
 }
 
@@ -1249,12 +1763,12 @@ worker_cleanup() {
         wait "$LAUNCHER_WATCHER_PID" 2>/dev/null || true
         LAUNCHER_WATCHER_PID=""
     fi
-    terminate_active_stage
-    stop_file_telemetry
     if (( WORKER_FINISHED == 0 )) && [[ -n $RUN_DIR && -d $RUN_DIR ]]; then
         write_state ABORTED "${CURRENT_STAGE:-interrupted}"
         printf '1\n' > "$RUN_DIR/exit-code"
     fi
+    cancel_privileged_broker
+    stop_file_telemetry
     if [[ -n $SESSION ]] && command_exists tmux && tmux has-session -t "$SESSION" 2>/dev/null; then
         tmux kill-session -t "$SESSION" 2>/dev/null || true
     fi
@@ -1274,7 +1788,7 @@ watch_launcher() {
 }
 
 worker_main() {
-    (($# == 18)) || die 'internal worker received invalid arguments'
+    (($# == 20)) || die 'internal worker received invalid arguments'
     RUN_DIR=$1
     MODE=$2
     CPU_DURATION=$3
@@ -1293,14 +1807,18 @@ worker_main() {
     BENCHMARK_DURATION=${16}
     BENCHMARK_WARMUP=${17}
     BENCHMARK_RUNS=${18}
+    STRESSAPPTEST_DURATION=${19}
+    MEMTESTER_LOOPS=${20}
     [[ -d $RUN_DIR ]] || die "run directory does not exist: $RUN_DIR"
     validate_duration "$CPU_DURATION"
     validate_duration "$CORE_DURATION"
     validate_duration "$CACHE_DURATION"
+    validate_duration "$STRESSAPPTEST_DURATION"
     validate_duration "$VM_DURATION"
     validate_duration "$BENCHMARK_DURATION"
     validate_duration "$BENCHMARK_WARMUP"
     validate_integer_range "$BENCHMARK_RUNS" 1 20 'benchmark runs'
+    validate_integer_range "$MEMTESTER_LOOPS" 1 100 'memtester loops'
     validate_integer_range "$MEMORY_PERCENT" 1 95 'memory percent'
     validate_integer_range "$REFRESH_RATE" 1 60 'refresh rate'
     validate_integer_range "$TEMPERATURE_THRESHOLD" 1 120 'temperature threshold'
@@ -1315,12 +1833,21 @@ worker_main() {
     fi
 
     write_state RUNNING preflight
+    start_privileged_broker
     start_file_telemetry
     local harness_status=1
     run_selected_stages || true
     stop_file_telemetry
-    collect_kernel_log
-    write_state COMPLETE complete
+    if ! collect_broker_telemetry; then
+        rm -f -- "$RUN_DIR/kernel.log"
+        printf 'privileged telemetry transfer failed\n' > "$RUN_DIR/kernel-errors.txt"
+    fi
+    if stop_privileged_broker; then
+        write_state COMPLETE complete
+    else
+        printf 'privileged broker shutdown failed\n' >> "$RUN_DIR/broker-errors.txt"
+        write_state ABORTED broker-shutdown
+    fi
     report_run "$RUN_DIR" > "$RUN_DIR/summary.txt" || true
 
     if grep -q '^Result: PASS$' "$RUN_DIR/summary.txt"; then
@@ -1366,7 +1893,7 @@ launch_tmux() {
     tui_command=$(shell_command s-tui --csv --csv-file \
         "$RUN_DIR/telemetry/s-tui.csv" --refresh-rate "$REFRESH_RATE" \
         --t_thresh "$TEMPERATURE_THRESHOLD")
-    journal_command="sudo journalctl -kf -o short-iso 2>&1 | tee -a $(printf '%q' "$RUN_DIR/live-kernel.log")"
+    journal_command=$(shell_command tail -n +1 -F "$RUN_DIR/events.log")
 
     window_target=$(tmux new-session -d -P -F '#{session_name}:#{window_index}' \
         -s "$SESSION" -x 140 -y 40 "$tui_command") ||
@@ -1379,6 +1906,7 @@ launch_tmux() {
         "$CACHE_DURATION" "$VM_DURATION" "$MEMORY_PERCENT" "$REFRESH_RATE"
         "$TEMPERATURE_THRESHOLD" "$CPU_LIST" "$SESSION" "$STARTED_AT" "$TUI_PANE" "$$"
         "$launcher_starttime" "$BENCHMARK_DURATION" "$BENCHMARK_WARMUP" "$BENCHMARK_RUNS"
+        "$STRESSAPPTEST_DURATION" "$MEMTESTER_LOOPS"
     )
     worker_command=$(shell_command bash -c '
         session=$1
@@ -1396,8 +1924,8 @@ launch_tmux() {
         tmux_setup_failure 'create journal pane'
     tmux select-layout -t "$window_target" tiled >/dev/null ||
         tmux_setup_failure 'select layout'
-    tmux select-pane -t "$TUI_PANE" ||
-        tmux_setup_failure 'select monitoring pane'
+    tmux select-pane -t "$WORKER_PANE" ||
+        tmux_setup_failure 'select authentication pane'
     tmux set-option -t "$SESSION" status-right "stress-uv $MODE | $RUN_DIR" >/dev/null ||
         tmux_setup_failure 'set status line'
 
@@ -1434,15 +1962,27 @@ confirm_run() {
 }
 
 preflight() {
+    local stage
+
     command_exists stress-ng || die 'stress-ng is required'
     command_exists sudo || die 'sudo is required'
     command_exists setsid || die 'setsid is required'
+    command_exists base64 || die 'base64 is required'
+    for stage in "${SELECTED_STAGES[@]}"; do
+        case $stage in
+            memory-stressapptest)
+                command_exists stressapptest || die 'stressapptest is required for this mode'
+                ;;
+            memory-memtester)
+                command_exists memtester || die 'memtester is required for this mode'
+                ;;
+        esac
+    done
     if (( NO_TUI == 0 )); then
         command_exists tmux || die 'tmux is required unless --no-tui is used'
         command_exists s-tui || die 's-tui is required unless --no-tui is used'
         [[ -t 0 && -t 1 ]] || die 'interactive mode requires a terminal; use --no-tui'
     fi
-    sudo -v || die 'sudo authentication failed'
 }
 
 create_run() {
@@ -1458,6 +1998,8 @@ create_run() {
     SESSION="stress-uv-${timestamp}-$$"
     STARTED_AT=$(date --iso-8601=seconds)
     : > "$RUN_DIR/stages.tsv"
+    : > "$RUN_DIR/events.log"
+    : > "$RUN_DIR/broker-errors.txt"
     if [[ $MODE == benchmark ]]; then
         IFS= read -r stress_ng_version < <(stress-ng --version)
         [[ -n $stress_ng_version ]] || die 'stress-ng returned no version string'
@@ -1525,18 +2067,16 @@ main() {
         worker_main "$RUN_DIR" "$MODE" "$CPU_DURATION" "$CORE_DURATION" \
             "$CACHE_DURATION" "$VM_DURATION" "$MEMORY_PERCENT" "$REFRESH_RATE" \
             "$TEMPERATURE_THRESHOLD" "$CPU_LIST" "$SESSION" "$STARTED_AT" "" "" "" \
-            "$BENCHMARK_DURATION" "$BENCHMARK_WARMUP" "$BENCHMARK_RUNS"
+            "$BENCHMARK_DURATION" "$BENCHMARK_WARMUP" "$BENCHMARK_RUNS" \
+            "$STRESSAPPTEST_DURATION" "$MEMTESTER_LOOPS"
     else
         launch_tmux
     fi
 }
 
-if [[ ${1:-} == __privileged_supervisor ]]; then
+if [[ ${1:-} == __broker ]]; then
     shift
-    privileged_supervisor_main "$@"
-elif [[ ${1:-} == __root_supervisor ]]; then
-    shift
-    root_supervisor_main "$@"
+    broker_main "$@"
 elif [[ ${1:-} == __worker ]]; then
     shift
     worker_main "$@"

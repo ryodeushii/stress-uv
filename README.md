@@ -1,10 +1,12 @@
 # stress-uv
 
 `stress-uv` is a Linux Bash harness for repeatable CPU and memory stability
-screening with [`stress-ng`](https://github.com/ColinIanKing/stress-ng). It runs
-focused workloads sequentially, records telemetry and kernel messages, and
-produces a conservative `PASS`, `FAIL`, `INCONCLUSIVE`, or `INCOMPLETE` result.
-It can also record repeatable local CPU throughput baselines.
+screening with [`stress-ng`](https://github.com/ColinIanKing/stress-ng),
+[`stressapptest`](https://github.com/stressapptest/stressapptest), and
+[`memtester`](https://pyropus.ca./software/memtester/). It runs focused
+workloads sequentially, records telemetry and kernel messages, and produces a
+conservative `PASS`, `FAIL`, `INCONCLUSIVE`, or `INCOMPLETE` result. It can also
+record repeatable local CPU throughput baselines.
 
 It is intended for checking CPU undervolts, CPU overclocks, cache/ring changes,
 and memory tuning. It does not modify voltages, clocks, firmware settings, or
@@ -18,13 +20,13 @@ power limits.
 
 ## What it does
 
-The harness provides three stability suites, five directly runnable stability
+The harness provides three stability suites, seven directly runnable stability
 stages, and one independent benchmark mode:
 
 | Mode | Stages, in order |
 | --- | --- |
 | `cpu` | `cpu-sustained`, `cpu-transition`, `cpu-core-cycle` |
-| `memory` | `memory-cache`, `memory-vm` |
+| `memory` | `memory-cache`, `memory-stressapptest`, `memory-memtester`, `memory-vm` |
 | `all` | Every CPU stage, then every memory stage |
 | `benchmark` | Single-thread then multi-thread vecfp throughput |
 
@@ -35,22 +37,33 @@ logical CPU instead of mixing every stressor concurrently.
 During a run, `stress-uv`:
 
 1. Prints the exact plan and asks you to type `RUN`, unless `--yes` is used.
-2. Authenticates with `sudo` and creates a private timestamped run directory.
-3. Records kernel, CPU topology, microcode, tool versions, and initial sensors.
+2. Creates a private timestamped run directory and records system metadata.
+3. Authenticates once, then starts one privileged broker for the complete run.
 4. Starts optional file telemetry with `turbostat` and `sensors`.
-5. Runs each selected `stress-ng` stage and records its exit status and log.
+5. Runs each selected stability stage and records its tool-specific exit status
+   and log.
 6. Captures kernel messages and checks for MCE, EDAC, lockup, hardware-error,
    verification-error, and out-of-memory evidence.
 7. Writes a summary and exits successfully only when the final result is
    `PASS`.
 
 Interactive mode creates a three-pane tmux session with s-tui, the stage
-runner, and a live kernel journal. Detach without stopping the run with
+runner, and the harness event log. Detach without stopping the run with
 `Ctrl-b d`. Use `--no-tui` for unattended or headless execution.
+
+The root broker accepts only fixed stage and telemetry requests. It stores
+privileged output in a root-private temporary directory and returns encoded
+artifacts to the unprivileged worker. The worker writes the run directory. No
+sudo timestamp refresh is needed during long runs.
+
+The broker executes this checkout as root. Use it only from a trusted checkout
+with an account that already has unrestricted sudo. Do not grant
+command-restricted sudoers access to this user-writable script; that requires a
+separate installed, root-owned helper.
 
 ## Workload methodology
 
-Every stability stage adds these common `stress-ng` controls:
+Every stress-ng stability stage adds these common controls:
 
 ```text
 --timeout DURATION --abort --verify --metrics-brief --klog-check --log-brief
@@ -61,7 +74,8 @@ Every stability stage adds these common `stress-ng` controls:
 - `--verify` enables sanity checks for stressors that support verification.
 - `--metrics-brief` emits a compact bogo-operation summary.
 - `--klog-check` asks stress-ng to report kernel warnings and errors.
-- `--log-brief` reduces log prefixes. The harness also supplies `--log-file`.
+- `--log-brief` reduces log prefixes. The privileged broker captures stage
+  output and returns it to the unprivileged artifact writer.
 
 ### `cpu-sustained`
 
@@ -115,6 +129,33 @@ useful for cache/ring/uncore and memory-path screening. It is not a complete
 DRAM test.
 
 Default duration: `20m`.
+
+### `memory-stressapptest`
+
+```text
+stressapptest -s SECONDS -M TOTAL_MIB -m WORKERS -W --max_errors 1
+```
+
+This uses stressapptest's memory-copy workload against the same bounded memory
+target used by the other memory stages. `-W` enables the more CPU-intensive
+copy path. `--max_errors 1` stops after the first detected error. The worker
+count matches the selected logical CPU count. A reported hardware-problem
+status produces `FAIL`; procedural failures produce `INCONCLUSIVE`.
+
+Default duration: `2h`.
+
+### `memory-memtester`
+
+```text
+memtester TOTAL_MIBM LOOPS
+```
+
+This runs memtester's stuck-address and data-pattern tests while Linux remains
+online. The root broker lets memtester lock its allocation. Exit-code bits for
+stuck-address or pattern-test failures produce `FAIL`; allocation and invocation
+errors without a test-failure bit produce `INCONCLUSIVE`.
+
+Default passes: `1`.
 
 ### `memory-vm`
 
@@ -177,6 +218,12 @@ Required in all non-dry runs:
 - `stress-ng`
 - `sudo`
 - `setsid` from util-linux
+- `base64` from GNU coreutils
+
+Required when the corresponding memory stages are selected:
+
+- `stressapptest`
+- `memtester`
 
 Required for the default interactive interface:
 
@@ -192,12 +239,16 @@ Install these tools through your distribution's package manager. Tool and
 package names vary by distribution. Confirm availability with:
 
 ```bash
-command -v stress-ng sudo setsid tmux s-tui
+command -v stress-ng stressapptest memtester sudo setsid base64 tmux s-tui
 command -v turbostat sensors
 ```
 
-The harness needs sudo access for stress-ng, turbostat when present, and kernel
-log collection. It validates sudo before creating a run.
+The harness authenticates once in the worker terminal, then starts one
+privileged broker for stress-ng, stressapptest, memtester, turbostat when
+present, and kernel log
+collection. Later stages do not call sudo again, so 12-24 h suites do not
+depend on an expiring sudo timestamp. If `SUDO_ASKPASS` names an executable,
+the harness tries `sudo -A` first and falls back to the worker terminal.
 
 ## Installation
 
@@ -234,6 +285,8 @@ Run one stage with a shorter duration:
 
 ```bash
 ./stress-uv cpu-sustained --cpu-duration 10m
+./stress-uv memory-stressapptest --stressapptest-duration 1h --memory-percent 70
+./stress-uv memory-memtester --memtester-loops 2 --memory-percent 70
 ./stress-uv memory-vm --vm-duration 1h --memory-percent 70
 ```
 
@@ -278,11 +331,13 @@ Re-evaluate an existing run directory:
 | `--cpu-duration TIME` | Sustained and transition stage duration | `20m` |
 | `--core-duration TIME` | Duration for each logical CPU | `1m` |
 | `--cache-duration TIME` | Cache stage duration | `20m` |
+| `--stressapptest-duration TIME` | stressapptest stage duration | `2h` |
+| `--memtester-loops N` | memtester passes (`1`-`100`) | `1` |
 | `--vm-duration TIME` | VM stage duration | `3h` |
 | `--benchmark-duration TIME` | Duration of each measured benchmark run | `60s` |
 | `--benchmark-warmup TIME` | Warm-up duration for each benchmark scope | `15s` |
 | `--benchmark-runs N` | Measured repetitions per scope (`1`-`20`) | `3` |
-| `--memory-percent N` | Calculated available memory used across VM workers (`1`-`90`) | `85` |
+| `--memory-percent N` | Calculated available memory used by memory allocation stages (`1`-`90`) | `85` |
 | `--output DIR` | Root directory for run artifacts | `./runs` |
 | `--refresh-rate SECONDS` | s-tui and turbostat interval | `2` |
 | `--temperature-threshold C` | s-tui warning threshold only (`40`-`110`) | `90` |
@@ -304,10 +359,11 @@ produce every file.
 | `state` | Atomic run state and last stage |
 | `exit-code` | Harness result for completed or aborted runs |
 | `expected-stages` | Exact expected stage manifest |
-| `stages.tsv` | Stage label, raw stress-ng exit status, and verdict |
-| `STAGE.log` | stress-ng output for a stage or logical CPU |
+| `stages.tsv` | Stage label, recorded status, and verdict; status `125` denotes a broker or protocol failure |
+| `STAGE.log` | Tool output for a stage or logical CPU |
 | `kernel.log` | Kernel messages collected for the run interval |
-| `live-kernel.log` | Live journal stream from interactive mode |
+| `events.log` | Stage start/end events shown in the third tmux pane |
+| `broker-errors.txt` | Privileged broker startup and protocol errors |
 | `metadata.txt` | Kernel, CPU topology, microcode, versions, and sensors |
 | `telemetry/s-tui.csv` | s-tui samples from interactive mode |
 | `telemetry/turbostat.txt` | turbostat samples when available |
@@ -362,18 +418,15 @@ bash tests/test_stress_uv.sh
 ```
 
 Tests cover stage ordering, benchmark metric parsing and comparison, cgroup
-v1/v2 memory bounds, report integrity, signal cleanup, delayed sudo handoff,
-PID reuse, tmux rollback, non-zero tmux base indices, and launcher death. The
-optional real sudo boundary check requires cached non-interactive sudo:
-
-```bash
-sudo -v
-STRESS_UV_TEST_ROOT_CLEANUP=1 bash tests/test_stress_uv.sh
-```
+v1/v2 memory bounds, report integrity, signal cleanup, single-broker privilege
+lifecycle, askpass fallback, per-tty sudo timestamps, PID reuse, tmux rollback,
+non-zero tmux base indices, and launcher death.
 
 ## References
 
 - [stress-ng upstream repository](https://github.com/ColinIanKing/stress-ng)
 - [stress-ng manual](https://github.com/ColinIanKing/stress-ng/blob/master/stress-ng.1)
+- [stressapptest upstream repository](https://github.com/stressapptest/stressapptest)
+- [memtester upstream site](https://pyropus.ca./software/memtester/)
 - [s-tui upstream repository](https://github.com/amanusk/s-tui)
 - [Memtest86+](https://memtest.org/)
