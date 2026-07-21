@@ -4,6 +4,7 @@
 screening with [`stress-ng`](https://github.com/ColinIanKing/stress-ng). It runs
 focused workloads sequentially, records telemetry and kernel messages, and
 produces a conservative `PASS`, `FAIL`, `INCONCLUSIVE`, or `INCOMPLETE` result.
+It can also record repeatable local CPU throughput baselines.
 
 It is intended for checking CPU undervolts, CPU overclocks, cache/ring changes,
 and memory tuning. It does not modify voltages, clocks, firmware settings, or
@@ -17,13 +18,15 @@ power limits.
 
 ## What it does
 
-The harness provides three suites and five directly runnable stages:
+The harness provides three stability suites, five directly runnable stability
+stages, and one independent benchmark mode:
 
 | Mode | Stages, in order |
 | --- | --- |
 | `cpu` | `cpu-sustained`, `cpu-transition`, `cpu-core-cycle` |
 | `memory` | `memory-cache`, `memory-vm` |
 | `all` | Every CPU stage, then every memory stage |
+| `benchmark` | Single-thread then multi-thread vecfp throughput |
 
 All stages run sequentially. `cpu-core-cycle` also tests the selected logical
 CPUs one at a time. This keeps failures attributable to a specific workload or
@@ -47,7 +50,7 @@ runner, and a live kernel journal. Detach without stopping the run with
 
 ## Workload methodology
 
-Every stage adds these common `stress-ng` controls:
+Every stability stage adds these common `stress-ng` controls:
 
 ```text
 --timeout DURATION --abort --verify --metrics-brief --klog-check --log-brief
@@ -116,7 +119,7 @@ Default duration: `20m`.
 ### `memory-vm`
 
 ```text
-stress-ng --vm WORKERS --vm-bytes MIB_PER_WORKER --vm-method all
+stress-ng --vm WORKERS --vm-bytes TOTAL_MIB --vm-method all
 ```
 
 The worker count matches the selected logical CPU count. `--vm-bytes` sets the
@@ -136,6 +139,34 @@ installed memory works. Use a boot-time tool such as Memtest86+ as an additional
 test when validating RAM.
 
 Default duration: `3h`.
+
+## Benchmark methodology
+
+`benchmark` is a separate performance mode. It does not run as part of `cpu`,
+`memory`, or `all`, and its throughput changes do not alter stability verdicts.
+It measures stress-ng's reported vecfp rates:
+
+```text
+stress-ng --vecfp 1 --vecfp-method all --taskset FIRST_SELECTED_CPU --metrics
+stress-ng --vecfp 0 --vecfp-method all --metrics
+```
+
+The first command measures one worker pinned to the first logical CPU selected
+by `--cpu-list`. The second uses stress-ng's zero-worker convention to measure
+all online CPUs. Each scope gets a warm-up followed by repeated measured runs.
+Defaults are a `15s` warm-up and three `60s` measured runs per scope.
+
+The harness extracts only stress-ng's named `Mfp-ops/sec` vecfp metrics. It does
+not use stress-ng bogo operations as benchmark scores. For each exact metric it
+records the median, minimum, maximum, and population coefficient of variation.
+Every metric must appear once in every repetition and in both scopes. Missing,
+duplicate, or inconsistent metric sets make the run inconclusive.
+
+These values are for before/after comparisons on the same machine. They depend
+on the CPU, stress-ng version and build, compiler, scheduler, thermals, and power
+limits. They are not portable public scores and are not comparable to Cinebench.
+`compare` rejects runs with different stress-ng versions, CPU selections, online
+CPU sets, durations, warm-ups, or repetition counts.
 
 ## Prerequisites
 
@@ -218,6 +249,21 @@ Run unattended after reviewing the dry-run plan:
 ./stress-uv all --no-tui --yes
 ```
 
+Record a local CPU performance baseline:
+
+```bash
+./stress-uv benchmark --no-tui
+./stress-uv benchmark --benchmark-warmup 30s --benchmark-duration 2m \
+  --benchmark-runs 5
+```
+
+Compare two compatible benchmark runs:
+
+```bash
+./stress-uv compare runs/20260721-120000-benchmark \
+  runs/20260721-130000-benchmark
+```
+
 Re-evaluate an existing run directory:
 
 ```bash
@@ -233,6 +279,9 @@ Re-evaluate an existing run directory:
 | `--core-duration TIME` | Duration for each logical CPU | `1m` |
 | `--cache-duration TIME` | Cache stage duration | `20m` |
 | `--vm-duration TIME` | VM stage duration | `3h` |
+| `--benchmark-duration TIME` | Duration of each measured benchmark run | `60s` |
+| `--benchmark-warmup TIME` | Warm-up duration for each benchmark scope | `15s` |
+| `--benchmark-runs N` | Measured repetitions per scope (`1`-`20`) | `3` |
 | `--memory-percent N` | Calculated available memory used across VM workers (`1`-`90`) | `85` |
 | `--output DIR` | Root directory for run artifacts | `./runs` |
 | `--refresh-rate SECONDS` | s-tui and turbostat interval | `2` |
@@ -263,6 +312,9 @@ produce every file.
 | `telemetry/s-tui.csv` | s-tui samples from interactive mode |
 | `telemetry/turbostat.txt` | turbostat samples when available |
 | `telemetry/sensors-*.txt` | Before/after lm-sensors snapshots |
+| `benchmark.tsv` | Raw vecfp metric values for every measured repetition |
+| `benchmark-summary.tsv` | Median, range, and coefficient of variation per metric |
+| `benchmark-context.tsv` | CPU selection, stress-ng version, and benchmark protocol |
 
 Verdict rules are deliberately conservative:
 
@@ -275,6 +327,8 @@ Verdict rules are deliberately conservative:
 - `INCOMPLETE`: the run did not reach its completed state.
 
 The report command returns `0` only for `PASS`; every other result returns `1`.
+The compare command returns `0` only when both benchmark contexts and metric
+sets are compatible.
 
 ## Choosing a stability process
 
@@ -289,6 +343,8 @@ Use this harness as one layer, not the entire validation process:
 7. Validate real applications and long idle/wake cycles after synthetic tests.
 8. Treat any WHEA/MCE/EDAC report, verification mismatch, crash, or unexplained
    process failure as instability until proven otherwise.
+9. Use `benchmark` before and after tuning to check local performance, but judge
+   stability from the stress suites and real workloads.
 
 Different workloads exercise different instruction mixes and voltage/frequency
 points. Passing this suite does not guarantee that Prime95/mprime, y-cruncher,
@@ -305,10 +361,10 @@ workload:
 bash tests/test_stress_uv.sh
 ```
 
-Tests cover stage ordering, cgroup v1/v2 memory bounds, report integrity,
-signal cleanup, delayed sudo handoff, PID reuse, tmux rollback, non-zero tmux
-base indices, and launcher death. The optional real sudo boundary check requires
-cached non-interactive sudo:
+Tests cover stage ordering, benchmark metric parsing and comparison, cgroup
+v1/v2 memory bounds, report integrity, signal cleanup, delayed sudo handoff,
+PID reuse, tmux rollback, non-zero tmux base indices, and launcher death. The
+optional real sudo boundary check requires cached non-interactive sudo:
 
 ```bash
 sudo -v

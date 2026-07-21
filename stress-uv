@@ -3,7 +3,7 @@
 set -u
 umask 077
 
-VERSION=0.1.0
+VERSION=0.2.0
 SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
 PROC_ROOT=${STRESS_UV_PROC_ROOT:-/proc}
 CGROUP_ROOT=${STRESS_UV_CGROUP_ROOT:-/sys/fs/cgroup}
@@ -18,6 +18,9 @@ CPU_DURATION=20m
 CORE_DURATION=1m
 CACHE_DURATION=20m
 VM_DURATION=3h
+BENCHMARK_DURATION=60s
+BENCHMARK_WARMUP=15s
+BENCHMARK_RUNS=3
 MEMORY_PERCENT=85
 REFRESH_RATE=2
 TEMPERATURE_THRESHOLD=90
@@ -47,12 +50,14 @@ usage() {
     cat <<'EOF'
 Usage:
   stress-uv MODE [OPTIONS]
+  stress-uv compare BASELINE_RUN CANDIDATE_RUN
   stress-uv report RUN_DIR
 
 Suites:
   cpu                 Run all CPU stability stages sequentially.
   memory              Run all memory stability stages sequentially.
   all                 Run cpu, then memory, sequentially.
+  benchmark           Measure local single/multi-thread vecfp throughput.
 
 Individual stages:
   cpu-sustained       Full all-CPU matrix workload.
@@ -67,6 +72,10 @@ Options:
   --core-duration TIME     Duration per logical CPU (default: 1m).
   --cache-duration TIME    Cache stage duration (default: 20m).
   --vm-duration TIME       VM stage duration (default: 3h).
+  --benchmark-duration TIME
+                            Duration per measured benchmark run (default: 60s).
+  --benchmark-warmup TIME  Duration per benchmark warm-up (default: 15s).
+  --benchmark-runs N       Measured runs per scope (default: 3).
   --memory-percent N       Percent of available RAM across all VM workers (default: 85).
   --output DIR             Run artifact root (default: ./runs).
   --refresh-rate SECONDS   s-tui and turbostat interval (default: 2).
@@ -274,6 +283,9 @@ select_stages() {
         all)
             SELECTED_STAGES=(cpu-sustained cpu-transition cpu-core-cycle memory-cache memory-vm)
             ;;
+        benchmark)
+            SELECTED_STAGES=(benchmark)
+            ;;
         cpu-sustained|cpu-transition|cpu-core-cycle|memory-cache|memory-vm)
             SELECTED_STAGES=("$MODE")
             ;;
@@ -281,6 +293,28 @@ select_stages() {
             die "unknown mode '$MODE'"
             ;;
     esac
+}
+
+build_benchmark_command() {
+    local scope=$1
+    local duration=$2
+    local cpu=${3:-}
+
+    case $scope in
+        single)
+            [[ $cpu =~ ^[0-9]+$ ]] || die 'single benchmark requires one numeric CPU ID'
+            STAGE_COMMAND=(stress-ng --vecfp 1 --vecfp-method all --taskset "$cpu")
+            ;;
+        multi)
+            STAGE_COMMAND=(stress-ng --vecfp 0 --vecfp-method all)
+            ;;
+        *)
+            die "unknown benchmark scope '$scope'"
+            ;;
+    esac
+
+    STAGE_COMMAND+=(--timeout "$duration" --abort --verify --metrics
+        --klog-check --log-brief)
 }
 
 build_stage_command() {
@@ -291,6 +325,22 @@ build_stage_command() {
     local duration
 
     case $stage in
+        benchmark-single-warmup)
+            build_benchmark_command single "$BENCHMARK_WARMUP" "${CPUS[0]}"
+            return
+            ;;
+        benchmark-single-run-*)
+            build_benchmark_command single "$BENCHMARK_DURATION" "${CPUS[0]}"
+            return
+            ;;
+        benchmark-multi-warmup)
+            build_benchmark_command multi "$BENCHMARK_WARMUP"
+            return
+            ;;
+        benchmark-multi-run-*)
+            build_benchmark_command multi "$BENCHMARK_DURATION"
+            return
+            ;;
         cpu-sustained)
             STAGE_COMMAND=(stress-ng --cpu 0 --cpu-method matrixprod)
             duration=$CPU_DURATION
@@ -336,10 +386,30 @@ print_plan() {
     local stage
     local cpu
     local vm_mib
+    local run
+    local benchmark_cpu
 
     printf 'MODE %s\n' "$MODE"
     for stage in "${SELECTED_STAGES[@]}"; do
-        if [[ $stage == cpu-core-cycle ]]; then
+        if [[ $stage == benchmark ]]; then
+            benchmark_cpu=${CPUS[0]}
+            printf 'STAGE benchmark-single-warmup cpu=%s\n' "$benchmark_cpu"
+            build_benchmark_command single "$BENCHMARK_WARMUP" "$benchmark_cpu"
+            print_command
+            for ((run = 1; run <= BENCHMARK_RUNS; run++)); do
+                printf 'STAGE benchmark-single-run-%s cpu=%s\n' "$run" "$benchmark_cpu"
+                build_benchmark_command single "$BENCHMARK_DURATION" "$benchmark_cpu"
+                print_command
+            done
+            printf 'STAGE benchmark-multi-warmup\n'
+            build_benchmark_command multi "$BENCHMARK_WARMUP"
+            print_command
+            for ((run = 1; run <= BENCHMARK_RUNS; run++)); do
+                printf 'STAGE benchmark-multi-run-%s\n' "$run"
+                build_benchmark_command multi "$BENCHMARK_DURATION"
+                print_command
+            done
+        elif [[ $stage == cpu-core-cycle ]]; then
             for cpu in "${CPUS[@]}"; do
                 printf 'STAGE cpu-core-cycle cpu=%s\n' "$cpu"
                 build_stage_command "$stage" "$cpu"
@@ -384,6 +454,21 @@ parse_options() {
             --vm-duration)
                 (($# >= 2)) || die '--vm-duration requires a value'
                 VM_DURATION=$2
+                shift 2
+                ;;
+            --benchmark-duration)
+                (($# >= 2)) || die '--benchmark-duration requires a value'
+                BENCHMARK_DURATION=$2
+                shift 2
+                ;;
+            --benchmark-warmup)
+                (($# >= 2)) || die '--benchmark-warmup requires a value'
+                BENCHMARK_WARMUP=$2
+                shift 2
+                ;;
+            --benchmark-runs)
+                (($# >= 2)) || die '--benchmark-runs requires a value'
+                BENCHMARK_RUNS=$2
                 shift 2
                 ;;
             --memory-percent)
@@ -436,6 +521,9 @@ parse_options() {
     validate_duration "$CORE_DURATION"
     validate_duration "$CACHE_DURATION"
     validate_duration "$VM_DURATION"
+    validate_duration "$BENCHMARK_DURATION"
+    validate_duration "$BENCHMARK_WARMUP"
+    validate_integer_range "$BENCHMARK_RUNS" 1 20 'benchmark runs'
     validate_integer_range "$MEMORY_PERCENT" 1 90 'memory percent'
     validate_integer_range "$TEMPERATURE_THRESHOLD" 40 110 'temperature threshold'
     [[ $REFRESH_RATE =~ ^[1-9][0-9]*([.][0-9]+)?$ ]] ||
@@ -456,6 +544,125 @@ state_value() {
         fi
     done < "$file"
     return 1
+}
+
+tsv_value() {
+    local file=$1
+    local wanted=$2
+    local key
+    local value
+    local extra
+    local result
+    local found=0
+
+    [[ -r $file ]] || return 1
+    while IFS=$'\t' read -r key value extra; do
+        [[ $key == "$wanted" ]] || continue
+        [[ -n $value && -z $extra && $found == 0 ]] || return 1
+        result=$value
+        found=1
+    done < "$file"
+    (( found == 1 )) || return 1
+    printf '%s\n' "$result"
+}
+
+compare_benchmarks() {
+    local baseline=$1
+    local candidate=$2
+    local baseline_context="$baseline/benchmark-context.tsv"
+    local candidate_context="$candidate/benchmark-context.tsv"
+    local baseline_value
+    local candidate_value
+    local key
+    local comparison
+
+    [[ -d $baseline ]] || die "baseline run directory does not exist: $baseline"
+    [[ -d $candidate ]] || die "candidate run directory does not exist: $candidate"
+    [[ -s $baseline/benchmark-summary.tsv && -s $candidate/benchmark-summary.tsv ]] ||
+        die 'both runs must contain benchmark-summary.tsv'
+
+    for key in format_version cpu_list single_cpu online_cpu_list stress_ng_version \
+        benchmark_duration benchmark_warmup benchmark_runs; do
+        baseline_value=$(tsv_value "$baseline_context" "$key") ||
+            die "baseline benchmark context is missing or invalid: $key"
+        candidate_value=$(tsv_value "$candidate_context" "$key") ||
+            die "candidate benchmark context is missing or invalid: $key"
+        if [[ $baseline_value != "$candidate_value" ]]; then
+            case $key in
+                cpu_list|single_cpu|online_cpu_list) die 'benchmark CPU selections differ' ;;
+                stress_ng_version) die 'stress-ng versions differ' ;;
+                format_version) die 'benchmark format versions differ' ;;
+                *) die 'benchmark protocols differ' ;;
+            esac
+        fi
+    done
+
+    comparison=$(LC_ALL=C awk -F '\t' '
+        function numeric(value) {
+            return value ~ /^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$/
+        }
+        NR == FNR {
+            if (FNR == 1) {
+                if ($0 != "scope\tmetric\tmedian_mfp_ops_per_sec\tmin\tmax\tcv_percent") invalid = 1
+                next
+            }
+            key = $1 SUBSEP $2
+            if (NF != 6 || ($1 != "single" && $1 != "multi") ||
+                $2 !~ / Mfp-ops\/sec$/ || !numeric($3) || !numeric($4) ||
+                !numeric($5) || !numeric($6) || $3 + 0 <= 0 || $4 + 0 <= 0 ||
+                $5 + 0 <= 0 || $6 + 0 < 0 || $4 + 0 > $3 + 0 ||
+                $3 + 0 > $5 + 0 || key in base) {
+                invalid = 1
+                next
+            }
+            base[key] = $3 + 0
+            base_scope[key] = $1
+            base_metric[key] = $2
+            base_metrics[$2] = 1
+            base_present[$1, $2] = 1
+            base_count++
+            next
+        }
+        FNR == 1 {
+            if ($0 != "scope\tmetric\tmedian_mfp_ops_per_sec\tmin\tmax\tcv_percent") invalid = 1
+            next
+        }
+        {
+            key = $1 SUBSEP $2
+            if (NF != 6 || ($1 != "single" && $1 != "multi") ||
+                $2 !~ / Mfp-ops\/sec$/ || !numeric($3) || !numeric($4) ||
+                !numeric($5) || !numeric($6) || $3 + 0 <= 0 || $4 + 0 <= 0 ||
+                $5 + 0 <= 0 || $6 + 0 < 0 || $4 + 0 > $3 + 0 ||
+                $3 + 0 > $5 + 0 || key in current) {
+                invalid = 1
+                next
+            }
+            current[key] = $3 + 0
+            current_metrics[$2] = 1
+            current_present[$1, $2] = 1
+            current_count++
+        }
+        END {
+            if (invalid || base_count == 0 || base_count != current_count) exit 1
+            for (metric in base_metrics) {
+                if (!base_present["single", metric] || !base_present["multi", metric]) exit 1
+            }
+            for (metric in current_metrics) {
+                if (!current_present["single", metric] || !current_present["multi", metric]) exit 1
+            }
+            for (key in base) if (!(key in current)) exit 1
+            for (key in current) if (!(key in base)) exit 1
+            for (key in base) {
+                delta = (current[key] - base[key]) / base[key] * 100
+                printf "%s\t%s\t%.3f\t%.3f\t%+.3f\n", \
+                    base_scope[key], base_metric[key], base[key], current[key], delta
+            }
+        }
+    ' "$baseline/benchmark-summary.tsv" "$candidate/benchmark-summary.tsv") ||
+        die 'benchmark summaries are malformed or metric sets differ'
+
+    printf 'scope\tmetric\tbaseline\tcandidate\tdelta_percent\n'
+    printf '%s\n' "$comparison" | sort -t $'\t' -k1,1 -k2,2
 }
 
 hardware_error_pattern() {
@@ -566,6 +773,8 @@ report_run() {
     [[ -f $dir/stages.tsv ]] && printf 'Stages: %s/stages.tsv\n' "$dir"
     [[ -f $dir/kernel.log ]] && printf 'Kernel log: %s/kernel.log\n' "$dir"
     [[ -d $dir/telemetry ]] && printf 'Telemetry: %s/telemetry\n' "$dir"
+    [[ -f $dir/benchmark-summary.tsv ]] &&
+        printf 'Benchmark summary: %s/benchmark-summary.tsv\n' "$dir"
     [[ $result == PASS ]]
 }
 
@@ -613,6 +822,7 @@ collect_metadata() {
 write_expected_stages() {
     local stage
     local cpu
+    local run
 
     : > "$RUN_DIR/expected-stages"
     for stage in "${SELECTED_STAGES[@]}"; do
@@ -620,10 +830,115 @@ write_expected_stages() {
             for cpu in "${CPUS[@]}"; do
                 printf '%s\n' "${stage}-cpu-${cpu}" >> "$RUN_DIR/expected-stages"
             done
+        elif [[ $stage == benchmark ]]; then
+            printf '%s\n' benchmark-single-warmup >> "$RUN_DIR/expected-stages"
+            for ((run = 1; run <= BENCHMARK_RUNS; run++)); do
+                printf 'benchmark-single-run-%s\n' "$run" >> "$RUN_DIR/expected-stages"
+            done
+            printf '%s\n' benchmark-multi-warmup >> "$RUN_DIR/expected-stages"
+            for ((run = 1; run <= BENCHMARK_RUNS; run++)); do
+                printf 'benchmark-multi-run-%s\n' "$run" >> "$RUN_DIR/expected-stages"
+            done
+            printf '%s\n' benchmark-summary >> "$RUN_DIR/expected-stages"
         else
             printf '%s\n' "$stage" >> "$RUN_DIR/expected-stages"
         fi
     done
+}
+
+extract_benchmark_metrics() {
+    local log=$1
+    local label=$2
+    local scope
+    local run
+    local temporary="$RUN_DIR/.benchmark-metrics.tmp"
+
+    case $label in
+        benchmark-single-run-*) scope=single ;;
+        benchmark-multi-run-*) scope=multi ;;
+        *) return 0 ;;
+    esac
+    run=${label##*-}
+    [[ $run =~ ^[1-9][0-9]*$ && -r $log ]] || return 1
+
+    LC_ALL=C awk -v scope="$scope" -v run="$run" '
+        {
+            for (i = 2; i < NF; i++) {
+                value = $(i - 1)
+                if ($(i + 1) == "Mfp-ops/sec" &&
+                    value ~ /^[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?$/ &&
+                    value + 0 > 0) {
+                    metric = $i " " $(i + 1)
+                    if (seen[metric]++) duplicate = 1
+                    else printf "%s\t%s\t%s\t%s\n", scope, run, metric, value
+                    found = 1
+                }
+            }
+        }
+        END { if (!found || duplicate) exit 1 }
+    ' "$log" > "$temporary" || {
+        rm -f -- "$temporary"
+        return 1
+    }
+    cat "$temporary" >> "$RUN_DIR/benchmark.tsv"
+    rm -f -- "$temporary"
+}
+
+write_benchmark_summary() {
+    local unsorted="$RUN_DIR/.benchmark-summary.tmp"
+
+    [[ -s $RUN_DIR/benchmark.tsv ]] || return 1
+    LC_ALL=C awk -F '\t' -v expected_runs="$BENCHMARK_RUNS" '
+        NR == 1 { next }
+        NF == 4 {
+            key = $1 SUBSEP $3
+            scope[key] = $1
+            metric[key] = $3
+            values[key, ++count[key]] = $4 + 0
+            sum[key] += $4
+        }
+        END {
+            for (key in count) {
+                if (!(metric[key] in metric_names)) metric_count++
+                metric_names[metric[key]] = 1
+                present[scope[key], metric[key]] = 1
+                if (count[key] != expected_runs) invalid = 1
+            }
+            for (name in metric_names) {
+                if (!(present["single", name]) || !(present["multi", name])) invalid = 1
+            }
+            if (invalid || metric_count == 0) exit 1
+            for (key in count) {
+                n = count[key]
+                for (i = 2; i <= n; i++) {
+                    value = values[key, i]
+                    j = i - 1
+                    while (j >= 1 && values[key, j] > value) {
+                        values[key, j + 1] = values[key, j]
+                        j--
+                    }
+                    values[key, j + 1] = value
+                }
+                if (n % 2) median = values[key, (n + 1) / 2]
+                else median = (values[key, n / 2] + values[key, n / 2 + 1]) / 2
+                mean = sum[key] / n
+                variance = 0
+                for (i = 1; i <= n; i++) variance += (values[key, i] - mean) ^ 2
+                variance /= n
+                cv = mean > 0 ? sqrt(variance) / mean * 100 : 0
+                printf "%s\t%s\t%.3f\t%.3f\t%.3f\t%.3f\n", \
+                    scope[key], metric[key], median, values[key, 1], values[key, n], cv
+            }
+        }
+    ' "$RUN_DIR/benchmark.tsv" > "$unsorted" || {
+        rm -f -- "$unsorted" "$RUN_DIR/benchmark-summary.tsv"
+        return 1
+    }
+    {
+        printf 'scope\tmetric\tmedian_mfp_ops_per_sec\tmin\tmax\tcv_percent\n'
+        sort -t $'\t' -k1,1 -k2,2 "$unsorted"
+    } > "$RUN_DIR/benchmark-summary.tsv"
+    rm -f -- "$unsorted"
 }
 
 start_file_telemetry() {
@@ -879,6 +1194,11 @@ run_stress_stage() {
     ACTIVE_STAGE_INNER_PGID_FILE=""
     rm -f -- "$outer_pgid_file" "$inner_pgid_file"
 
+    if (( exit_status == 0 )) && [[ $label == benchmark-*-run-* ]] &&
+        ! extract_benchmark_metrics "$log" "$label"; then
+        printf 'stress-uv: missing or invalid Mfp-ops/sec metrics\n' >> "$log"
+        exit_status=125
+    fi
     verdict=$(stage_verdict_for_exit "$exit_status")
     printf '%s\t%s\t%s\n' "$label" "$exit_status" "$verdict" >> "$RUN_DIR/stages.tsv"
     printf '[%s] END %s exit=%s verdict=%s\n' \
@@ -889,12 +1209,28 @@ run_stress_stage() {
 run_selected_stages() {
     local stage
     local cpu
+    local run
 
     for stage in "${SELECTED_STAGES[@]}"; do
         if [[ $stage == cpu-core-cycle ]]; then
             for cpu in "${CPUS[@]}"; do
                 run_stress_stage "$stage" "$cpu" || return $?
             done
+        elif [[ $stage == benchmark ]]; then
+            run_stress_stage benchmark-single-warmup || return $?
+            for ((run = 1; run <= BENCHMARK_RUNS; run++)); do
+                run_stress_stage "benchmark-single-run-${run}" || return $?
+            done
+            run_stress_stage benchmark-multi-warmup || return $?
+            for ((run = 1; run <= BENCHMARK_RUNS; run++)); do
+                run_stress_stage "benchmark-multi-run-${run}" || return $?
+            done
+            if write_benchmark_summary; then
+                printf 'benchmark-summary\t0\tPASS\n' >> "$RUN_DIR/stages.tsv"
+            else
+                printf 'benchmark-summary\t125\tERROR\n' >> "$RUN_DIR/stages.tsv"
+                return 125
+            fi
         else
             run_stress_stage "$stage" || return $?
         fi
@@ -938,7 +1274,7 @@ watch_launcher() {
 }
 
 worker_main() {
-    (($# == 15)) || die 'internal worker received invalid arguments'
+    (($# == 18)) || die 'internal worker received invalid arguments'
     RUN_DIR=$1
     MODE=$2
     CPU_DURATION=$3
@@ -954,11 +1290,17 @@ worker_main() {
     TUI_PANE=${13}
     LAUNCHER_PID=${14}
     LAUNCHER_STARTTIME=${15}
+    BENCHMARK_DURATION=${16}
+    BENCHMARK_WARMUP=${17}
+    BENCHMARK_RUNS=${18}
     [[ -d $RUN_DIR ]] || die "run directory does not exist: $RUN_DIR"
     validate_duration "$CPU_DURATION"
     validate_duration "$CORE_DURATION"
     validate_duration "$CACHE_DURATION"
     validate_duration "$VM_DURATION"
+    validate_duration "$BENCHMARK_DURATION"
+    validate_duration "$BENCHMARK_WARMUP"
+    validate_integer_range "$BENCHMARK_RUNS" 1 20 'benchmark runs'
     validate_integer_range "$MEMORY_PERCENT" 1 95 'memory percent'
     validate_integer_range "$REFRESH_RATE" 1 60 'refresh rate'
     validate_integer_range "$TEMPERATURE_THRESHOLD" 1 120 'temperature threshold'
@@ -1036,7 +1378,7 @@ launch_tmux() {
         "$RUN_DIR" "$MODE" "$CPU_DURATION" "$CORE_DURATION"
         "$CACHE_DURATION" "$VM_DURATION" "$MEMORY_PERCENT" "$REFRESH_RATE"
         "$TEMPERATURE_THRESHOLD" "$CPU_LIST" "$SESSION" "$STARTED_AT" "$TUI_PANE" "$$"
-        "$launcher_starttime"
+        "$launcher_starttime" "$BENCHMARK_DURATION" "$BENCHMARK_WARMUP" "$BENCHMARK_RUNS"
     )
     worker_command=$(shell_command bash -c '
         session=$1
@@ -1105,6 +1447,8 @@ preflight() {
 
 create_run() {
     local timestamp
+    local stress_ng_version
+    local online_cpu_list
 
     timestamp=$(date '+%Y%m%d-%H%M%S')
     mkdir -p -- "$OUTPUT_ROOT"
@@ -1114,6 +1458,22 @@ create_run() {
     SESSION="stress-uv-${timestamp}-$$"
     STARTED_AT=$(date --iso-8601=seconds)
     : > "$RUN_DIR/stages.tsv"
+    if [[ $MODE == benchmark ]]; then
+        IFS= read -r stress_ng_version < <(stress-ng --version)
+        [[ -n $stress_ng_version ]] || die 'stress-ng returned no version string'
+        online_cpu_list=$(default_cpu_list)
+        printf 'scope\trun\tmetric\tvalue\n' > "$RUN_DIR/benchmark.tsv"
+        {
+            printf 'format_version\t1\n'
+            printf 'cpu_list\t%s\n' "$CPU_LIST"
+            printf 'single_cpu\t%s\n' "${CPUS[0]}"
+            printf 'online_cpu_list\t%s\n' "$online_cpu_list"
+            printf 'stress_ng_version\t%s\n' "$stress_ng_version"
+            printf 'benchmark_duration\t%s\n' "$BENCHMARK_DURATION"
+            printf 'benchmark_warmup\t%s\n' "$BENCHMARK_WARMUP"
+            printf 'benchmark_runs\t%s\n' "$BENCHMARK_RUNS"
+        } > "$RUN_DIR/benchmark-context.tsv"
+    fi
     write_expected_stages
     write_state RUNNING created
     collect_metadata
@@ -1139,6 +1499,11 @@ main() {
             report_run "$2"
             return
             ;;
+        compare)
+            (($# == 3)) || die 'usage: stress-uv compare BASELINE_RUN CANDIDATE_RUN'
+            compare_benchmarks "$2" "$3"
+            return
+            ;;
     esac
 
     MODE=$1
@@ -1159,7 +1524,8 @@ main() {
     if (( NO_TUI == 1 )); then
         worker_main "$RUN_DIR" "$MODE" "$CPU_DURATION" "$CORE_DURATION" \
             "$CACHE_DURATION" "$VM_DURATION" "$MEMORY_PERCENT" "$REFRESH_RATE" \
-            "$TEMPERATURE_THRESHOLD" "$CPU_LIST" "$SESSION" "$STARTED_AT" "" "" ""
+            "$TEMPERATURE_THRESHOLD" "$CPU_LIST" "$SESSION" "$STARTED_AT" "" "" "" \
+            "$BENCHMARK_DURATION" "$BENCHMARK_WARMUP" "$BENCHMARK_RUNS"
     else
         launch_tmux
     fi

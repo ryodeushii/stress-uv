@@ -146,7 +146,31 @@ test_help_lists_suites_and_stages() {
     assert_contains "$output" 'cpu-core-cycle'
     assert_contains "$output" 'memory-cache'
     assert_contains "$output" 'memory-vm'
+    assert_contains "$output" 'benchmark'
+    assert_contains "$output" '--benchmark-duration'
+    assert_contains "$output" '--benchmark-warmup'
+    assert_contains "$output" '--benchmark-runs'
+    assert_contains "$output" 'compare BASELINE_RUN CANDIDATE_RUN'
     assert_contains "$output" 'report RUN_DIR'
+}
+
+test_benchmark_dry_run_uses_vecfp_repetitions() {
+    local output
+
+    output=$("$HARNESS" benchmark --dry-run --cpu-list 2 \
+        --benchmark-duration 30s --benchmark-warmup 5s --benchmark-runs 2)
+
+    assert_order "$output" \
+        'STAGE benchmark-single-warmup cpu=2' \
+        'STAGE benchmark-single-run-1 cpu=2' \
+        'STAGE benchmark-single-run-2 cpu=2' \
+        'STAGE benchmark-multi-warmup' \
+        'STAGE benchmark-multi-run-1' \
+        'STAGE benchmark-multi-run-2'
+    assert_contains "$output" '--vecfp 1 --vecfp-method all --taskset 2 --timeout 5s'
+    assert_contains "$output" '--vecfp 0 --vecfp-method all --timeout 30s'
+    assert_contains "$output" '--metrics'
+    assert_not_contains "$output" '--metrics-brief'
 }
 
 test_cpu_dry_run_is_sequential_and_cycles_each_cpu() {
@@ -437,6 +461,28 @@ if [[ ${STRESS_NG_BLOCK:-0} == 1 ]]; then
     trap 'printf "terminated\n" > "$STRESS_NG_TERM_FILE"; exit 143' TERM INT HUP
     while :; do sleep 1; done
 fi
+case $log_file in
+    *benchmark-single-run-1.log) values='100 50' ;;
+    *benchmark-single-run-2.log) values='102 51' ;;
+    *benchmark-single-run-3.log) values='104 52' ;;
+    *benchmark-multi-run-1.log) values='800 400' ;;
+    *benchmark-multi-run-2.log) values='816 408' ;;
+    *benchmark-multi-run-3.log) values='832 416' ;;
+    *) values='' ;;
+esac
+if [[ -n $values && ${STRESS_NG_NO_METRICS:-0} != 1 ]]; then
+    read -r add_rate mul_rate <<< "$values"
+    {
+        printf 'stress-ng: metrc: [1] vecfp %s float128add Mfp-ops/sec (harmonic mean of 1 instance)\n' "$add_rate"
+        if [[ ${STRESS_NG_DUPLICATE_METRICS:-0} == 1 ]]; then
+            printf 'stress-ng: metrc: [1] vecfp %s float128add Mfp-ops/sec (harmonic mean duplicate)\n' "$add_rate"
+        fi
+        if [[ ${STRESS_NG_INCONSISTENT_METRICS:-0} != 1 || $log_file != *run-2.log ]]; then
+            printf 'stress-ng: metrc: [1] vecfp %s float128mul Mfp-ops/sec (harmonic mean of 1 instance)\n' "$mul_rate"
+        fi
+    } | tee "$log_file"
+    exit "${STRESS_NG_EXIT:-0}"
+fi
 printf 'stress-ng mock completed\n' | tee "$log_file"
 exit "${STRESS_NG_EXIT:-0}"
 EOF
@@ -488,6 +534,225 @@ test_headless_stage_records_complete_pass() {
     assert_file_contains "$run_dir/stages.tsv" $'memory-cache\t0\tPASS'
     assert_file_contains "$run_dir/memory-cache.log" 'stress-ng mock completed'
     assert_file_contains "$run_dir/telemetry/turbostat.txt" 'PkgWatt'
+}
+
+test_headless_benchmark_writes_metrics_and_summary() {
+    local output
+    local run_dirs
+    local run_dir
+
+    create_mock_tools
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" "$HARNESS" benchmark \
+        --yes --no-tui --benchmark-duration 1s --benchmark-warmup 1s \
+        --benchmark-runs 3 --cpu-list 2 --output "$TEST_TMP/runs")
+    run_dirs=("$TEST_TMP/runs"/*)
+    run_dir=${run_dirs[0]}
+
+    assert_contains "$output" 'Result: PASS'
+    assert_contains "$output" 'Benchmark summary:'
+    assert_file_contains "$run_dir/stages.tsv" $'benchmark-single-run-3\t0\tPASS'
+    assert_file_contains "$run_dir/stages.tsv" $'benchmark-multi-run-3\t0\tPASS'
+    assert_file_contains "$run_dir/stages.tsv" $'benchmark-summary\t0\tPASS'
+    assert_file_contains "$run_dir/benchmark.tsv" $'single\t1\tfloat128add Mfp-ops/sec\t100'
+    assert_file_contains "$run_dir/benchmark.tsv" $'multi\t3\tfloat128mul Mfp-ops/sec\t416'
+    assert_file_contains "$run_dir/benchmark-summary.tsv" $'single\tfloat128add Mfp-ops/sec\t102.000\t100.000\t104.000\t1.601'
+    assert_file_contains "$run_dir/benchmark-summary.tsv" $'multi\tfloat128mul Mfp-ops/sec\t408.000\t400.000\t416.000\t1.601'
+    assert_file_contains "$run_dir/benchmark-context.tsv" $'cpu_list\t2'
+    assert_file_contains "$run_dir/benchmark-context.tsv" $'stress_ng_version\tstress-ng mock 1.0'
+}
+
+test_headless_benchmark_rejects_inconsistent_metric_sets() {
+    local output
+    local exit_status
+    local run_dirs
+    local run_dir
+
+    create_mock_tools
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" STRESS_NG_INCONSISTENT_METRICS=1 \
+        "$HARNESS" benchmark --yes --no-tui --benchmark-duration 1s \
+        --benchmark-warmup 1s --benchmark-runs 3 --cpu-list 2 \
+        --output "$TEST_TMP/runs")
+    exit_status=$?
+    run_dirs=("$TEST_TMP/runs"/*)
+    run_dir=${run_dirs[0]}
+
+    assert_equals "$exit_status" 1
+    assert_contains "$output" 'Result: INCONCLUSIVE'
+    assert_file_contains "$run_dir/stages.tsv" $'benchmark-summary\t125\tERROR'
+    [[ ! -e $run_dir/benchmark-summary.tsv ]] ||
+        fail 'inconsistent metrics produced a benchmark summary'
+}
+
+test_headless_benchmark_rejects_missing_metrics() {
+    local output
+    local exit_status
+    local run_dirs
+    local run_dir
+
+    create_mock_tools
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" STRESS_NG_NO_METRICS=1 \
+        "$HARNESS" benchmark --yes --no-tui --benchmark-duration 1s \
+        --benchmark-warmup 1s --benchmark-runs 1 --cpu-list 2 \
+        --output "$TEST_TMP/runs")
+    exit_status=$?
+    run_dirs=("$TEST_TMP/runs"/*)
+    run_dir=${run_dirs[0]}
+
+    assert_equals "$exit_status" 1
+    assert_contains "$output" 'Result: INCONCLUSIVE'
+    assert_contains "$output" 'stage error'
+    assert_file_contains "$run_dir/stages.tsv" $'benchmark-single-run-1\t125\tERROR'
+    assert_file_contains "$run_dir/benchmark-single-run-1.log" 'missing or invalid Mfp-ops/sec metrics'
+    [[ ! -e $run_dir/benchmark-summary.tsv ]] ||
+        fail 'missing metrics produced a benchmark summary'
+}
+
+test_headless_benchmark_rejects_duplicate_metrics() {
+    local output
+    local exit_status
+    local run_dirs
+    local run_dir
+
+    create_mock_tools
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" STRESS_NG_DUPLICATE_METRICS=1 \
+        "$HARNESS" benchmark --yes --no-tui --benchmark-duration 1s \
+        --benchmark-warmup 1s --benchmark-runs 1 --cpu-list 2 \
+        --output "$TEST_TMP/runs")
+    exit_status=$?
+    run_dirs=("$TEST_TMP/runs"/*)
+    run_dir=${run_dirs[0]}
+
+    assert_equals "$exit_status" 1
+    assert_contains "$output" 'Result: INCONCLUSIVE'
+    assert_file_contains "$run_dir/stages.tsv" $'benchmark-single-run-1\t125\tERROR'
+    [[ ! -e $run_dir/benchmark-summary.tsv ]] ||
+        fail 'duplicate metrics produced a benchmark summary'
+}
+
+write_benchmark_fixture() {
+    local directory=$1
+    local version=$2
+    local single_add=$3
+    local multi_add=$4
+    local duration=${5:-60s}
+
+    mkdir -p "$directory"
+    {
+        printf 'format_version\t1\n'
+        printf 'cpu_list\t2\n'
+        printf 'single_cpu\t2\n'
+        printf 'online_cpu_list\t0-3\n'
+        printf 'stress_ng_version\t%s\n' "$version"
+        printf 'benchmark_duration\t%s\n' "$duration"
+        printf 'benchmark_warmup\t15s\n'
+        printf 'benchmark_runs\t3\n'
+    } > "$directory/benchmark-context.tsv"
+    {
+        printf 'scope\tmetric\tmedian_mfp_ops_per_sec\tmin\tmax\tcv_percent\n'
+        printf 'single\tfloat128add Mfp-ops/sec\t%s\t%s\t%s\t1.000\n' \
+            "$single_add" "$single_add" "$single_add"
+        printf 'multi\tfloat128add Mfp-ops/sec\t%s\t%s\t%s\t1.000\n' \
+            "$multi_add" "$multi_add" "$multi_add"
+    } > "$directory/benchmark-summary.tsv"
+}
+
+test_compare_reports_metric_deltas() {
+    local output
+
+    write_benchmark_fixture "$TEST_TMP/baseline" 'stress-ng mock 1.0' 100 800
+    write_benchmark_fixture "$TEST_TMP/candidate" 'stress-ng mock 1.0' 105 760
+
+    output=$("$HARNESS" compare "$TEST_TMP/baseline" "$TEST_TMP/candidate")
+
+    assert_contains "$output" $'scope\tmetric\tbaseline\tcandidate\tdelta_percent'
+    assert_contains "$output" $'single\tfloat128add Mfp-ops/sec\t100.000\t105.000\t+5.000'
+    assert_contains "$output" $'multi\tfloat128add Mfp-ops/sec\t800.000\t760.000\t-5.000'
+}
+
+test_compare_rejects_incompatible_context() {
+    local output
+    local exit_status
+
+    write_benchmark_fixture "$TEST_TMP/baseline" 'stress-ng mock 1.0' 100 800
+    write_benchmark_fixture "$TEST_TMP/candidate" 'stress-ng mock 2.0' 105 760
+
+    output=$("$HARNESS" compare "$TEST_TMP/baseline" "$TEST_TMP/candidate" 2>&1)
+    exit_status=$?
+
+    assert_equals "$exit_status" 2
+    assert_contains "$output" 'stress-ng versions differ'
+}
+
+test_compare_rejects_different_benchmark_protocols() {
+    local output
+    local exit_status
+
+    write_benchmark_fixture "$TEST_TMP/baseline" 'stress-ng mock 1.0' 100 800 60s
+    write_benchmark_fixture "$TEST_TMP/candidate" 'stress-ng mock 1.0' 105 760 30s
+
+    output=$("$HARNESS" compare "$TEST_TMP/baseline" "$TEST_TMP/candidate" 2>&1)
+    exit_status=$?
+
+    assert_equals "$exit_status" 2
+    assert_contains "$output" 'benchmark protocols differ'
+}
+
+test_compare_rejects_duplicate_context_keys() {
+    local output
+    local exit_status
+
+    write_benchmark_fixture "$TEST_TMP/baseline" 'stress-ng mock 1.0' 100 800
+    write_benchmark_fixture "$TEST_TMP/candidate" 'stress-ng mock 1.0' 105 760
+    printf 'stress_ng_version\tstress-ng conflicting 2.0\n' >> \
+        "$TEST_TMP/candidate/benchmark-context.tsv"
+
+    output=$("$HARNESS" compare "$TEST_TMP/baseline" "$TEST_TMP/candidate" 2>&1)
+    exit_status=$?
+
+    assert_equals "$exit_status" 2
+    assert_contains "$output" 'candidate benchmark context is missing or invalid: stress_ng_version'
+}
+
+test_compare_rejects_invalid_summary_contract() {
+    local output
+    local exit_status
+    local directory
+
+    for directory in "$TEST_TMP/baseline" "$TEST_TMP/candidate"; do
+        write_benchmark_fixture "$directory" 'stress-ng mock 1.0' 100 800
+        {
+            printf 'scope\tmetric\tmedian_mfp_ops_per_sec\tmin\tmax\tcv_percent\n'
+            printf 'single\tfloat128add Mfp-ops/sec\t100\tBROKEN\t104\t1.0\n'
+            printf 'multi\tfloat128add Mfp-ops/sec\t800\t790\t810\tBROKEN\n'
+        } > "$directory/benchmark-summary.tsv"
+    done
+
+    output=$("$HARNESS" compare "$TEST_TMP/baseline" "$TEST_TMP/candidate" 2>&1)
+    exit_status=$?
+
+    assert_equals "$exit_status" 2
+    assert_contains "$output" 'benchmark summaries are malformed or metric sets differ'
+}
+
+test_compare_rejects_disjoint_scope_metrics() {
+    local output
+    local exit_status
+    local directory
+
+    for directory in "$TEST_TMP/baseline" "$TEST_TMP/candidate"; do
+        write_benchmark_fixture "$directory" 'stress-ng mock 1.0' 100 800
+        {
+            printf 'scope\tmetric\tmedian_mfp_ops_per_sec\tmin\tmax\tcv_percent\n'
+            printf 'single\tfloat128add Mfp-ops/sec\t100\t99\t101\t1.0\n'
+            printf 'multi\tfloat128mul Mfp-ops/sec\t800\t790\t810\t1.0\n'
+        } > "$directory/benchmark-summary.tsv"
+    done
+
+    output=$("$HARNESS" compare "$TEST_TMP/baseline" "$TEST_TMP/candidate" 2>&1)
+    exit_status=$?
+
+    assert_equals "$exit_status" 2
+    assert_contains "$output" 'benchmark summaries are malformed or metric sets differ'
 }
 
 test_headless_stage_propagates_stressor_failure() {
@@ -744,7 +1009,7 @@ EOF
     assert_file_contains "$run_dir/state" 'status=ABORTED'
 }
 
-test_tmux_supports_nonzero_window_and_pane_base_indices() {
+test_tmux_benchmark_supports_nonzero_window_and_pane_base_indices() {
     local command
     local output
 
@@ -767,7 +1032,8 @@ EOF
         "TMUX=" \
         "TMUX_TMPDIR=$TEST_TMP/tmux" \
         "TERM=xterm-256color" \
-        "$HARNESS" cpu-sustained --yes --cpu-duration 1s --cpu-list 0 \
+        "$HARNESS" benchmark --yes --benchmark-duration 1s \
+        --benchmark-warmup 1s --benchmark-runs 1 --cpu-list 0 \
         --output "$TEST_TMP/runs"
 
     output=$(TERM=xterm-256color TMUX= TMUX_TMPDIR="$TEST_TMP/tmux" \
@@ -862,6 +1128,7 @@ EOF
 }
 
 run_test 'help lists suites and stages' test_help_lists_suites_and_stages
+run_test 'benchmark plan uses repeated vecfp runs' test_benchmark_dry_run_uses_vecfp_repetitions
 run_test 'CPU plan is sequential and cycles each CPU' test_cpu_dry_run_is_sequential_and_cycles_each_cpu
 run_test 'all plan runs CPU before memory' test_all_dry_run_orders_cpu_before_memory
 run_test 'VM allocation respects cgroup v2 headroom' test_vm_allocation_respects_cgroup_v2_headroom
@@ -878,6 +1145,16 @@ run_test 'report rejects duplicate and malformed stage records' test_report_reje
 run_test 'report rejects exit and verdict contradictions' test_report_rejects_exit_verdict_contradictions
 run_test 'report exit status matches verdict' test_report_exit_status_matches_verdict
 run_test 'headless stage records a complete passing run' test_headless_stage_records_complete_pass
+run_test 'headless benchmark writes metrics and summary' test_headless_benchmark_writes_metrics_and_summary
+run_test 'headless benchmark rejects inconsistent metric sets' test_headless_benchmark_rejects_inconsistent_metric_sets
+run_test 'headless benchmark rejects missing metrics' test_headless_benchmark_rejects_missing_metrics
+run_test 'headless benchmark rejects duplicate metrics' test_headless_benchmark_rejects_duplicate_metrics
+run_test 'compare reports benchmark metric deltas' test_compare_reports_metric_deltas
+run_test 'compare rejects incompatible benchmark context' test_compare_rejects_incompatible_context
+run_test 'compare rejects different benchmark protocols' test_compare_rejects_different_benchmark_protocols
+run_test 'compare rejects duplicate context keys' test_compare_rejects_duplicate_context_keys
+run_test 'compare rejects invalid summary contract' test_compare_rejects_invalid_summary_contract
+run_test 'compare rejects disjoint scope metrics' test_compare_rejects_disjoint_scope_metrics
 run_test 'headless stage propagates stressor failure' test_headless_stage_propagates_stressor_failure
 run_test 'signals stop stressor and mark run aborted' test_signal_stops_stressor_and_marks_run_aborted
 run_test 'signals during sudo handoff stop delayed child' test_signal_during_sudo_handoff_stops_delayed_child
@@ -885,7 +1162,7 @@ run_test 'real sudo cleanup crosses privilege boundary when enabled' test_real_s
 run_test 'process identity rejects zombies and PID reuse' test_process_identity_rejects_zombies_and_pid_reuse
 run_test 'launcher detach marker lets worker continue' test_launcher_detach_marker_allows_worker_to_continue
 run_test 'tmux setup failure rolls back session' test_tmux_setup_failure_rolls_back_session
-run_test 'tmux supports nonzero base indices' test_tmux_supports_nonzero_window_and_pane_base_indices
+run_test 'tmux benchmark supports nonzero base indices' test_tmux_benchmark_supports_nonzero_window_and_pane_base_indices
 run_test 'signals to tmux launcher abort session and stressor' test_signal_to_tmux_launcher_aborts_session_and_stressor
 
 printf '1..%d\n' "$TESTS_RUN"
