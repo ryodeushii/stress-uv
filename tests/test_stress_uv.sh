@@ -10,6 +10,7 @@ TESTS_FAILED=0
 
 setup() {
     TEST_TMP=$(mktemp -d)
+    export STRESS_UV_SYS_CPU_ROOT="$TEST_TMP/sys"
 }
 
 teardown() {
@@ -175,6 +176,8 @@ test_help_lists_suites_and_stages() {
 test_benchmark_dry_run_uses_vecfp_repetitions() {
     local output
 
+    mkdir -p "$STRESS_UV_SYS_CPU_ROOT"
+    printf '2-3\n' > "$STRESS_UV_SYS_CPU_ROOT/online"
     output=$("$HARNESS" benchmark --dry-run --cpu-list 2 \
         --benchmark-duration 30s --benchmark-warmup 5s --benchmark-runs 2)
 
@@ -186,9 +189,24 @@ test_benchmark_dry_run_uses_vecfp_repetitions() {
         'STAGE benchmark-multi-run-1' \
         'STAGE benchmark-multi-run-2'
     assert_contains "$output" '--vecfp 1 --vecfp-method all --taskset 2 --timeout 5s'
-    assert_contains "$output" '--vecfp 0 --vecfp-method all --timeout 30s'
+    assert_contains "$output" '--vecfp 2 --vecfp-method all --taskset 2\,3 --timeout 30s'
     assert_contains "$output" '--metrics'
     assert_not_contains "$output" '--metrics-brief'
+}
+
+test_benchmark_rejects_duration_too_short_for_frequency_evidence() {
+    local output
+    local exit_status
+
+    mkdir -p "$STRESS_UV_SYS_CPU_ROOT"
+    printf '2\n' > "$STRESS_UV_SYS_CPU_ROOT/online"
+
+    output=$("$HARNESS" benchmark --dry-run --cpu-list 2 \
+        --benchmark-duration 4.9s 2>&1)
+    exit_status=$?
+
+    assert_equals "$exit_status" 2
+    assert_contains "$output" 'benchmark duration must be at least 5s for frequency evidence'
 }
 
 test_cpu_dry_run_is_sequential_and_cycles_each_cpu() {
@@ -461,7 +479,10 @@ test_report_exit_status_matches_verdict() {
 }
 
 create_mock_tools() {
-    mkdir -p "$TEST_TMP/bin"
+    mkdir -p "$TEST_TMP/bin" "$STRESS_UV_SYS_CPU_ROOT/cpu2/topology"
+    printf '2\n' > "$STRESS_UV_SYS_CPU_ROOT/online"
+    printf '0\n' > "$STRESS_UV_SYS_CPU_ROOT/cpu2/topology/physical_package_id"
+    printf '1\n' > "$STRESS_UV_SYS_CPU_ROOT/cpu2/topology/core_id"
 
     cat > "$TEST_TMP/bin/sudo" <<'EOF'
 #!/usr/bin/env bash
@@ -530,6 +551,7 @@ if [[ ${1:-} == --version ]]; then
     printf 'stress-ng mock 1.0\n'
     exit 0
 fi
+[[ -n ${STRESS_NG_COMMAND_LOG:-} ]] && printf '%s\n' "$*" >> "$STRESS_NG_COMMAND_LOG"
 log_file=''
 while (($#)); do
     if [[ $1 == --log-file ]]; then log_file=$2; shift 2; else shift; fi
@@ -602,10 +624,41 @@ exec /usr/bin/base64 "$@"
 EOF
     cat > "$TEST_TMP/bin/turbostat" <<'EOF'
 #!/usr/bin/env bash
+original_args=$*
 output=''
+cpu_set=''
 while (($#)); do
-    if [[ $1 == --out ]]; then output=$2; shift 2; else shift; fi
+    case $1 in
+        --out) output=$2; shift 2 ;;
+        --cpu) cpu_set=$2; shift 2 ;;
+        *) shift ;;
+    esac
 done
+[[ -n ${TURBOSTAT_COMMAND_LOG:-} ]] && printf '%s\n' "$original_args" >> "$TURBOSTAT_COMMAND_LOG"
+if [[ $output == *benchmark-frequency-* ]]; then
+    [[ ${TURBOSTAT_FREQUENCY_FAIL:-0} == 1 ]] && exit 1
+    case $output in
+        *benchmark-single-run-*) bzy_base=4500; avg_base=4400 ;;
+        *benchmark-multi-run-*) bzy_base=4200; avg_base=4100 ;;
+        *) exit 2 ;;
+    esac
+    : > "$output"
+    for sample in 0 1 2 3 4; do
+        printf 'Time_Of_Day_Seconds\tCPU\tAvg_MHz\tBusy%%\tBzy_MHz\n' >> "$output"
+        printf '%s\t-\t%s\t99.%s\t%s\n' \
+            "$((100 + sample))" "$((avg_base + sample * 10))" "$sample" \
+            "$((bzy_base + sample * 10))" >> "$output"
+        IFS=',' read -r -a cpus <<< "$cpu_set"
+        for cpu in "${cpus[@]}"; do
+            [[ $cpu == "${TURBOSTAT_DROP_CPU:-}" ]] && continue
+            printf '%s\t%s\t%s\t99.%s\t%s\n' \
+                "$((100 + sample))" "$cpu" "$((avg_base + sample * 10))" \
+                "$sample" "$((bzy_base + sample * 10))" >> "$output"
+        done
+    done
+    trap 'exit 0' INT TERM HUP
+    while :; do sleep 1; done
+fi
 printf 'PkgWatt CoreTmp Avg_MHz\n20.0 55 4800\n' > "$output"
 EOF
     cat > "$TEST_TMP/bin/sensors" <<'EOF'
@@ -625,6 +678,13 @@ EOF
 printf 'Linux mock 1.0 x86_64\n'
 EOF
     chmod +x "$TEST_TMP/bin/"*
+}
+
+configure_two_mock_cpus() {
+    mkdir -p "$STRESS_UV_SYS_CPU_ROOT/cpu3/topology"
+    printf '2-3\n' > "$STRESS_UV_SYS_CPU_ROOT/online"
+    printf '0\n' > "$STRESS_UV_SYS_CPU_ROOT/cpu3/topology/physical_package_id"
+    printf '2\n' > "$STRESS_UV_SYS_CPU_ROOT/cpu3/topology/core_id"
 }
 
 test_headless_stage_records_complete_pass() {
@@ -730,7 +790,7 @@ test_idle_broker_exits_when_worker_dies() {
     PATH="$TEST_TMP/bin:/usr/bin:/bin" \
         STRESS_UV_TEST_BROKER_TMP_PARENT="$TEST_TMP/broker-tmp" \
         "$HARNESS" __broker cpu 1s 1s 1s 1s 1 1 0 \
-        '2026-01-01T00:00:00+00:00' 1s 1s 1 \
+        '' '2026-01-01T00:00:00+00:00' 1s 1s 1 \
         "$worker_pid" "$worker_starttime" "$(id -u)" \
         "$TEST_TMP/broker-requests" 1s 1 > "$TEST_TMP/broker.out" 2>&1 &
     broker_pid=$!
@@ -798,8 +858,19 @@ test_headless_benchmark_writes_metrics_and_summary() {
     local run_dir
 
     create_mock_tools
-    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" "$HARNESS" benchmark \
-        --yes --no-tui --benchmark-duration 1s --benchmark-warmup 1s \
+    mkdir -p "$TEST_TMP/sys/cpu2" "$TEST_TMP/sys/cpufreq/policy2"
+    ln -s "$TEST_TMP/sys/cpufreq/policy2" "$TEST_TMP/sys/cpu2/cpufreq"
+    printf 'mock-driver\n' > "$TEST_TMP/sys/cpufreq/policy2/scaling_driver"
+    printf 'performance\n' > "$TEST_TMP/sys/cpufreq/policy2/scaling_governor"
+    printf '1000000\n' > "$TEST_TMP/sys/cpufreq/policy2/scaling_min_freq"
+    printf '5000000\n' > "$TEST_TMP/sys/cpufreq/policy2/scaling_max_freq"
+    printf '800000\n' > "$TEST_TMP/sys/cpufreq/policy2/cpuinfo_min_freq"
+    printf '5200000\n' > "$TEST_TMP/sys/cpufreq/policy2/cpuinfo_max_freq"
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" \
+        STRESS_UV_SYS_CPU_ROOT="$TEST_TMP/sys" \
+        TURBOSTAT_COMMAND_LOG="$TEST_TMP/turbostat-commands.log" \
+        "$HARNESS" benchmark \
+        --yes --no-tui --benchmark-duration 5s --benchmark-warmup 1s \
         --benchmark-runs 3 --cpu-list 2 --output "$TEST_TMP/runs")
     run_dirs=("$TEST_TMP/runs"/*)
     run_dir=${run_dirs[0]}
@@ -813,8 +884,78 @@ test_headless_benchmark_writes_metrics_and_summary() {
     assert_file_contains "$run_dir/benchmark.tsv" $'multi\t3\tfloat128mul Mfp-ops/sec\t416'
     assert_file_contains "$run_dir/benchmark-summary.tsv" $'single\tfloat128add Mfp-ops/sec\t102.000\t100.000\t104.000\t1.601'
     assert_file_contains "$run_dir/benchmark-summary.tsv" $'multi\tfloat128mul Mfp-ops/sec\t408.000\t400.000\t416.000\t1.601'
+    assert_file_contains "$run_dir/benchmark-frequencies.tsv" \
+        $'single\t1\t3\t102\t0\t1\t2\t4420\t99.2\t4520'
+    assert_file_contains "$run_dir/benchmark-frequencies.tsv" \
+        $'multi\t3\t4\t103\t0\t1\t2\t4130\t99.3\t4230'
+    assert_file_contains "$run_dir/benchmark-frequency-summary.tsv" \
+        $'single\t0\t1\t2\t4520.000\t4510.000\t4530.000\t4420.000\t99.200\t9'
+    assert_file_contains "$run_dir/benchmark-frequency-summary.tsv" \
+        $'multi\t0\t1\t2\t4220.000\t4210.000\t4230.000\t4120.000\t99.200\t9'
+    assert_file_contains "$run_dir/benchmark-cpu-config.tsv" \
+        $'2\tpolicy2\tmock-driver\tperformance\t1000000\t5000000\t800000\t5200000'
     assert_file_contains "$run_dir/benchmark-context.tsv" $'cpu_list\t2'
+    assert_file_contains "$run_dir/benchmark-context.tsv" $'format_version\t2'
     assert_file_contains "$run_dir/benchmark-context.tsv" $'stress_ng_version\tstress-ng mock 1.0'
+    assert_file_contains "$TEST_TMP/turbostat-commands.log" '--interval 1 --cpu 2'
+    assert_file_contains "$TEST_TMP/turbostat-commands.log" \
+        '--show CPU,Avg_MHz,Busy%,Bzy_MHz --enable Time_Of_Day_Seconds'
+}
+
+test_headless_benchmark_uses_recorded_cpu_sets() {
+    local output
+    local run_dirs
+    local run_dir
+
+    create_mock_tools
+    configure_two_mock_cpus
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" \
+        STRESS_NG_COMMAND_LOG="$TEST_TMP/stress-ng-commands.log" \
+        TURBOSTAT_COMMAND_LOG="$TEST_TMP/turbostat-commands.log" \
+        "$HARNESS" benchmark --yes --no-tui --benchmark-duration 5s \
+        --benchmark-warmup 1s --benchmark-runs 1 --cpu-list 3 \
+        --output "$TEST_TMP/runs")
+    run_dirs=("$TEST_TMP/runs"/*)
+    run_dir=${run_dirs[0]}
+
+    assert_contains "$output" 'Result: PASS'
+    assert_file_contains "$run_dir/benchmark-context.tsv" $'cpu_list\t3'
+    assert_file_contains "$run_dir/benchmark-context.tsv" $'single_cpu\t3'
+    assert_file_contains "$run_dir/benchmark-context.tsv" $'online_cpu_list\t2,3'
+    assert_file_contains "$TEST_TMP/stress-ng-commands.log" \
+        '--vecfp 1 --vecfp-method all --taskset 3'
+    assert_file_contains "$TEST_TMP/stress-ng-commands.log" \
+        '--vecfp 2 --vecfp-method all --taskset 2,3'
+    assert_file_contains "$TEST_TMP/turbostat-commands.log" '--cpu 3'
+    assert_file_contains "$TEST_TMP/turbostat-commands.log" '--cpu 2,3'
+    assert_file_contains "$run_dir/benchmark-cpu-config.tsv" $'2\tunavailable'
+    assert_file_contains "$run_dir/benchmark-cpu-config.tsv" $'3\tunavailable'
+    assert_file_contains "$run_dir/benchmark-frequency-summary.tsv" $'single\t0\t2\t3'
+    assert_file_contains "$run_dir/benchmark-frequency-summary.tsv" $'multi\t0\t1\t2'
+    assert_file_contains "$run_dir/benchmark-frequency-summary.tsv" $'multi\t0\t2\t3'
+}
+
+test_headless_benchmark_rejects_partial_cpu_frequency_evidence() {
+    local output
+    local exit_status
+    local run_dirs
+    local run_dir
+
+    create_mock_tools
+    configure_two_mock_cpus
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" TURBOSTAT_DROP_CPU=3 \
+        "$HARNESS" benchmark --yes --no-tui --benchmark-duration 5s \
+        --benchmark-warmup 1s --benchmark-runs 1 --cpu-list 2 \
+        --output "$TEST_TMP/runs")
+    exit_status=$?
+    run_dirs=("$TEST_TMP/runs"/*)
+    run_dir=${run_dirs[0]}
+
+    assert_equals "$exit_status" 1
+    assert_contains "$output" 'Result: INCONCLUSIVE'
+    assert_file_contains "$run_dir/stages.tsv" $'benchmark-multi-run-1\t125\tERROR'
+    [[ ! -e $run_dir/benchmark-frequency-summary.tsv ]] ||
+        fail 'partial CPU frequency evidence produced a benchmark summary'
 }
 
 test_headless_benchmark_rejects_inconsistent_metric_sets() {
@@ -825,7 +966,7 @@ test_headless_benchmark_rejects_inconsistent_metric_sets() {
 
     create_mock_tools
     output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" STRESS_NG_INCONSISTENT_METRICS=1 \
-        "$HARNESS" benchmark --yes --no-tui --benchmark-duration 1s \
+        "$HARNESS" benchmark --yes --no-tui --benchmark-duration 5s \
         --benchmark-warmup 1s --benchmark-runs 3 --cpu-list 2 \
         --output "$TEST_TMP/runs")
     exit_status=$?
@@ -847,7 +988,7 @@ test_headless_benchmark_rejects_missing_metrics() {
 
     create_mock_tools
     output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" STRESS_NG_NO_METRICS=1 \
-        "$HARNESS" benchmark --yes --no-tui --benchmark-duration 1s \
+        "$HARNESS" benchmark --yes --no-tui --benchmark-duration 5s \
         --benchmark-warmup 1s --benchmark-runs 1 --cpu-list 2 \
         --output "$TEST_TMP/runs")
     exit_status=$?
@@ -871,7 +1012,7 @@ test_headless_benchmark_rejects_duplicate_metrics() {
 
     create_mock_tools
     output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" STRESS_NG_DUPLICATE_METRICS=1 \
-        "$HARNESS" benchmark --yes --no-tui --benchmark-duration 1s \
+        "$HARNESS" benchmark --yes --no-tui --benchmark-duration 5s \
         --benchmark-warmup 1s --benchmark-runs 1 --cpu-list 2 \
         --output "$TEST_TMP/runs")
     exit_status=$?
@@ -885,19 +1026,45 @@ test_headless_benchmark_rejects_duplicate_metrics() {
         fail 'duplicate metrics produced a benchmark summary'
 }
 
+test_headless_benchmark_requires_frequency_evidence() {
+    local output
+    local exit_status
+    local run_dirs
+    local run_dir
+
+    create_mock_tools
+    output=$(PATH="$TEST_TMP/bin:/usr/bin:/bin" TURBOSTAT_FREQUENCY_FAIL=1 \
+        "$HARNESS" benchmark --yes --no-tui --benchmark-duration 5s \
+        --benchmark-warmup 1s --benchmark-runs 1 --cpu-list 2 \
+        --output "$TEST_TMP/runs")
+    exit_status=$?
+    run_dirs=("$TEST_TMP/runs"/*)
+    run_dir=${run_dirs[0]}
+
+    assert_equals "$exit_status" 1
+    assert_contains "$output" 'Result: INCONCLUSIVE'
+    assert_file_contains "$run_dir/stages.tsv" $'benchmark-single-run-1\t125\tERROR'
+    assert_file_contains "$run_dir/benchmark-single-run-1.log" \
+        'benchmark frequency collector failed to start'
+    [[ ! -e $run_dir/benchmark-frequency-summary.tsv ]] ||
+        fail 'missing frequency evidence produced a frequency summary'
+}
+
 write_benchmark_fixture() {
     local directory=$1
     local version=$2
     local single_add=$3
     local multi_add=$4
     local duration=${5:-60s}
+    local single_bzy=${6:-4500}
+    local multi_bzy=${7:-4200}
 
     mkdir -p "$directory"
     {
-        printf 'format_version\t1\n'
+        printf 'format_version\t2\n'
         printf 'cpu_list\t2\n'
         printf 'single_cpu\t2\n'
-        printf 'online_cpu_list\t0-3\n'
+        printf 'online_cpu_list\t2\n'
         printf 'stress_ng_version\t%s\n' "$version"
         printf 'benchmark_duration\t%s\n' "$duration"
         printf 'benchmark_warmup\t15s\n'
@@ -910,19 +1077,82 @@ write_benchmark_fixture() {
         printf 'multi\tfloat128add Mfp-ops/sec\t%s\t%s\t%s\t1.000\n' \
             "$multi_add" "$multi_add" "$multi_add"
     } > "$directory/benchmark-summary.tsv"
+    {
+        printf 'scope\tpackage\tcore\tcpu\tmedian_bzy_mhz\tp05_bzy_mhz\tp95_bzy_mhz\tmedian_avg_mhz\tmedian_busy_percent\tsample_count\n'
+        printf 'single\t0\t1\t2\t%s\t%s\t%s\t%s\t99.000\t9\n' \
+            "$single_bzy" "$((single_bzy - 50))" "$((single_bzy + 50))" \
+            "$((single_bzy - 100))"
+        printf 'multi\t0\t1\t2\t%s\t%s\t%s\t%s\t98.000\t9\n' \
+            "$multi_bzy" "$((multi_bzy - 50))" "$((multi_bzy + 50))" \
+            "$((multi_bzy - 100))"
+    } > "$directory/benchmark-frequency-summary.tsv"
+    {
+        printf 'cpu\tpolicy\tscaling_driver\tscaling_governor\tscaling_min_khz\tscaling_max_khz\tcpuinfo_min_khz\tcpuinfo_max_khz\tboost\tno_turbo\n'
+        printf '2\tpolicy2\tmock-driver\tperformance\t1000000\t5000000\t800000\t5200000\tunavailable\t0\n'
+    } > "$directory/benchmark-cpu-config.tsv"
 }
 
 test_compare_reports_metric_deltas() {
     local output
 
-    write_benchmark_fixture "$TEST_TMP/baseline" 'stress-ng mock 1.0' 100 800
-    write_benchmark_fixture "$TEST_TMP/candidate" 'stress-ng mock 1.0' 105 760
+    write_benchmark_fixture "$TEST_TMP/baseline" 'stress-ng mock 1.0' 100 800 60s 4500 4200
+    write_benchmark_fixture "$TEST_TMP/candidate" 'stress-ng mock 1.0' 105 760 60s 4590 4116
 
     output=$("$HARNESS" compare "$TEST_TMP/baseline" "$TEST_TMP/candidate")
 
     assert_contains "$output" $'scope\tmetric\tbaseline\tcandidate\tdelta_percent'
     assert_contains "$output" $'single\tfloat128add Mfp-ops/sec\t100.000\t105.000\t+5.000'
     assert_contains "$output" $'multi\tfloat128add Mfp-ops/sec\t800.000\t760.000\t-5.000'
+    assert_contains "$output" 'Achieved CPU frequency:'
+    assert_contains "$output" $'single\t0\t1\t2\t4450.000\t4540.000\t4500.000\t4590.000\t+2.000\t99.000\t99.000'
+    assert_contains "$output" $'multi\t0\t1\t2\t4150.000\t4066.000\t4200.000\t4116.000\t-2.000\t98.000\t98.000'
+    assert_contains "$output" 'CPU frequency configuration:'
+    assert_contains "$output" $'2\tscaling_governor\tperformance\tperformance'
+}
+
+test_compare_rejects_missing_frequency_evidence() {
+    local output
+    local exit_status
+
+    write_benchmark_fixture "$TEST_TMP/baseline" 'stress-ng mock 1.0' 100 800
+    write_benchmark_fixture "$TEST_TMP/candidate" 'stress-ng mock 1.0' 105 760
+    rm "$TEST_TMP/candidate/benchmark-frequency-summary.tsv"
+
+    output=$("$HARNESS" compare "$TEST_TMP/baseline" "$TEST_TMP/candidate" 2>&1)
+    exit_status=$?
+
+    assert_equals "$exit_status" 2
+    assert_contains "$output" 'both runs must contain benchmark-frequency-summary.tsv'
+}
+
+test_compare_rejects_frequency_topology_mismatch() {
+    local output
+    local exit_status
+
+    write_benchmark_fixture "$TEST_TMP/baseline" 'stress-ng mock 1.0' 100 800
+    write_benchmark_fixture "$TEST_TMP/candidate" 'stress-ng mock 1.0' 105 760
+    sed -i $'s/\t2\t4500/\t3\t4500/' "$TEST_TMP/candidate/benchmark-frequency-summary.tsv"
+
+    output=$("$HARNESS" compare "$TEST_TMP/baseline" "$TEST_TMP/candidate" 2>&1)
+    exit_status=$?
+
+    assert_equals "$exit_status" 2
+    assert_contains "$output" 'frequency summaries are malformed or CPU sets differ'
+}
+
+test_compare_rejects_too_few_frequency_samples_for_repetitions() {
+    local output
+    local exit_status
+
+    write_benchmark_fixture "$TEST_TMP/baseline" 'stress-ng mock 1.0' 100 800
+    write_benchmark_fixture "$TEST_TMP/candidate" 'stress-ng mock 1.0' 105 760
+    sed -i $'s/\t9$/\t8/' "$TEST_TMP/candidate/benchmark-frequency-summary.tsv"
+
+    output=$("$HARNESS" compare "$TEST_TMP/baseline" "$TEST_TMP/candidate" 2>&1)
+    exit_status=$?
+
+    assert_equals "$exit_status" 2
+    assert_contains "$output" 'frequency summaries are malformed or CPU sets differ'
 }
 
 test_compare_rejects_incompatible_context() {
@@ -1293,8 +1523,8 @@ EOF
         "TMUX=" \
         "TMUX_TMPDIR=$TEST_TMP/tmux" \
         "TERM=xterm-256color" \
-        "$HARNESS" benchmark --yes --benchmark-duration 1s \
-        --benchmark-warmup 1s --benchmark-runs 1 --cpu-list 0 \
+        "$HARNESS" benchmark --yes --benchmark-duration 5s \
+        --benchmark-warmup 1s --benchmark-runs 1 --cpu-list 2 \
         --output "$TEST_TMP/runs"
 
     output=$(TERM=xterm-256color TMUX= TMUX_TMPDIR="$TEST_TMP/tmux" \
@@ -1327,8 +1557,8 @@ EOF
         SUDO_TTY_TICKETS=1 \
         "SUDO_TIMESTAMP_DIR=$TEST_TMP/sudo-timestamps" \
         "SUDO_LOG=$TEST_TMP/sudo.log" \
-        "$HARNESS" benchmark --yes --benchmark-duration 1s \
-        --benchmark-warmup 1s --benchmark-runs 1 --cpu-list 0 \
+        "$HARNESS" benchmark --yes --benchmark-duration 5s \
+        --benchmark-warmup 1s --benchmark-runs 1 --cpu-list 2 \
         --output "$TEST_TMP/runs"
 
     output=$(TERM=xterm-256color TMUX= TMUX_TMPDIR="$TEST_TMP/tmux" \
@@ -1430,6 +1660,7 @@ EOF
 
 run_test 'help lists suites and stages' test_help_lists_suites_and_stages
 run_test 'benchmark plan uses repeated vecfp runs' test_benchmark_dry_run_uses_vecfp_repetitions
+run_test 'benchmark rejects durations too short for frequency evidence' test_benchmark_rejects_duration_too_short_for_frequency_evidence
 run_test 'CPU plan is sequential and cycles each CPU' test_cpu_dry_run_is_sequential_and_cycles_each_cpu
 run_test 'all plan runs CPU before memory' test_all_dry_run_orders_cpu_before_memory
 run_test 'memory plan uses official tools sequentially' test_memory_dry_run_uses_stressapptest_and_memtester_sequentially
@@ -1450,10 +1681,16 @@ run_test 'headless stage records a complete passing run' test_headless_stage_rec
 run_test 'headless official memory stages record commands' test_headless_official_memory_stages_record_commands
 run_test 'official memory errors are failures' test_official_memory_errors_are_failures
 run_test 'headless benchmark writes metrics and summary' test_headless_benchmark_writes_metrics_and_summary
+run_test 'headless benchmark uses recorded CPU sets' test_headless_benchmark_uses_recorded_cpu_sets
+run_test 'headless benchmark rejects partial CPU frequency evidence' test_headless_benchmark_rejects_partial_cpu_frequency_evidence
 run_test 'headless benchmark rejects inconsistent metric sets' test_headless_benchmark_rejects_inconsistent_metric_sets
 run_test 'headless benchmark rejects missing metrics' test_headless_benchmark_rejects_missing_metrics
 run_test 'headless benchmark rejects duplicate metrics' test_headless_benchmark_rejects_duplicate_metrics
+run_test 'headless benchmark requires frequency evidence' test_headless_benchmark_requires_frequency_evidence
 run_test 'compare reports benchmark metric deltas' test_compare_reports_metric_deltas
+run_test 'compare rejects missing frequency evidence' test_compare_rejects_missing_frequency_evidence
+run_test 'compare rejects frequency topology mismatch' test_compare_rejects_frequency_topology_mismatch
+run_test 'compare rejects too few frequency samples for repetitions' test_compare_rejects_too_few_frequency_samples_for_repetitions
 run_test 'compare rejects incompatible benchmark context' test_compare_rejects_incompatible_context
 run_test 'compare rejects different benchmark protocols' test_compare_rejects_different_benchmark_protocols
 run_test 'compare rejects duplicate context keys' test_compare_rejects_duplicate_context_keys
